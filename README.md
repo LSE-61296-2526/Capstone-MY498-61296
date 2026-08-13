@@ -1,9 +1,10 @@
 # Violence Reduction and Immediate Access to Higher Education
+## Post-Conflict Evidence from Colombia
 
 **Post-Conflict Evidence from Colombia — MY498 Capstone Project**
 
 MSc Applied Social Data Science, Department of Methodology, LSE
-Author: Juliana Aragon · Candidate 61296 · Supervisor: Eleonor Power
+Candidate 61296 · Supervisor: Eleanor Power
 
 This repository contains all the code, data references, and outputs needed to
 reproduce the dissertation. The project estimates the effect of the 2014 FARC
@@ -153,7 +154,6 @@ committed to the repo; download and place each set in the folder shown.
 
 Result tables and figures in `1. Data/Final/` and `3. Results/` are regenerated
 by the scripts, so they do not need to be downloaded.
-
 ---
 
 ## 7. Reproducibility notes
