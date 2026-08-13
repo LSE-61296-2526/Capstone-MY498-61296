@@ -121,19 +121,6 @@ done
 
 (Or simply open each script in RStudio and source it in order.)
 
-### Build the dissertation
-
-After the pipeline has produced the tables and figures:
-
-```bash
-quarto render "4. Dissertation/MY498_Capstone_Candidate_61296.qmd"
-```
-
-The `.qmd` reads the generated tables from `1. Data/Final/` and the figures from
-`3. Results/`, and produces `MY498_Capstone_Candidate_61296.pdf`.
-
----
-
 ## 5. Key methodological choices (for reference)
 
 - **Treatment event:** permanent FARC ceasefire (20 Dec 2014). Exam-year 2014 is
@@ -145,8 +132,8 @@ The `.qmd` reads the generated tables from `1. Data/Final/` and the figures from
   (B) high vs. low intensity split at the median of exposed municipalities, and
   (C) continuous `log1p(attacks per capita)`. The main contrast is heavy
   exposure (high) vs. unexposed.
-- **Sample:** 1,109 municipalities; the 13 largest cities are dropped in the
-  main specification (re-included in an appendix robustness check).
+- **Sample:** 1,102 municipalities; the 13 largest cities are dropped in the
+  main specification (re-included in an appendix robustness check) and municipalities with zero exam-takers previous to the ceasefire are dropped too.
 - **Attribution:** FARC set = `FARC`, `FARC/ELN`, `FARC/EPL`; unidentified
   perpetrators tracked separately (see `00_functions.R`).
 
@@ -159,10 +146,10 @@ committed to the repo; download and place each set in the folder shown.
 
 | Folder | Dataset | Source |
 |--------|---------|--------|
-| `1. Data/SIEVCAC/` | Conflict-violence cases & victims by type; DIVIPOLA municipality codes | CNMH — Observatorio de Memoria y Conflicto (SIEVCAC) |
-| `1. Data/Saber11/` | Saber 11 exam microdata 2010–2023; SNIES higher-ed enrolment key | ICFES / MEN (SNIES) |
-| `1. Data/Municipality/` | TerriData fiscal, economic, education, poverty dimensions; coca crops; IPC; municipal boundaries (MGN geojson) | DNP TerriData; UNODC/SIMCI; DANE |
-| `1. Data/Population/` | Municipal population projections 2005–2042 | DANE |
+| `1. Data/SIEVCAC/` | Conflict-violence cases & victims by type; DIVIPOLA municipality codes | CNMH — Observatorio de Memoria y Conflicto (SIEVCAC) https://micrositios.centrodememoriahistorica.gov.co/observatorio/sievcac/ |
+| `1. Data/Saber11/` | Saber 11 exam microdata 2010–2023; SNIES higher-ed enrolment key | ICFES / MEN (SNIES) https://www.icfes.gov.co/investigaciones/data-icfes/ |
+| `1. Data/Municipality/` | TerriData fiscal, economic, education, poverty dimensions; coca crops; IPC; municipal boundaries (MGN geojson) | DNP TerriData; UNODC/SIMCI https://terridata.dnp.gov.co/index-app.html#/descargas |
+| `1. Data/Population/` | Municipal population projections 2005–2042 | DANE https://www.dane.gov.co/index.php/estadisticas-por-tema-2/demografia-y-poblacion/series-de-poblacion |
 
 Result tables and figures in `1. Data/Final/` and `3. Results/` are regenerated
 by the scripts, so they do not need to be downloaded.
@@ -171,11 +158,7 @@ by the scripts, so they do not need to be downloaded.
 
 ## 7. Reproducibility notes
 
-- The pipeline is deterministic; no random seeds are required.
+- The pipeline is deterministic. No random seeds are required.
 - Figures use a shared colorblind-safe palette and theme (`farc_palette`,
   `theme_capstone()` in `00_functions.R`) so every figure is styled
   consistently, including those built inside the dissertation `.qmd`.
-- If a script fails on a missing input, confirm the earlier step ran and wrote
-  its `.rds` to the expected folder (see the run-order table).
-- No `renv` lockfile is included; use the package list in Section 1. For an exact
-  environment, consider running `renv::init()` after a first successful run.

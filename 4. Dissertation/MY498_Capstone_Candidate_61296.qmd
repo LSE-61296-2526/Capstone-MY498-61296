@@ -1790,4 +1790,4 @@ ggplot(sx_sens, aes(x = x, colour = method)) +
 
 # Replication material
 
-All data and analytical workflows necessary for reproducing the reported results are hosted in the public GitHub repository X. The accompanying README file details the repository organisation, describes the contents of each folder and script, and outlines the procedures required for replication. 
+All data and analytical workflows necessary for reproducing the reported results are hosted in the public GitHub repository <https://github.com/LSE-61296-2526/Capstone-MY498-61296>. The accompanying README file details the repository organisation, describes the contents of each folder and script, and outlines the procedures required for replication. 
