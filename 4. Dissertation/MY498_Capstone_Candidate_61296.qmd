@@ -1,0 +1,1793 @@
+---
+title: "Violence Reduction and Immediate Access to Higher Education"
+subtitle: "Post-Conflict Evidence from Colombia — MY498 Capstone Project"
+author:
+  - "Candidate Number 61296"
+  - "Supervisor: Eleonor Power"
+  - "MSc Applied Social Data Science - Department of Methodology, LSE"
+date: "2026-08-13"
+format:
+  pdf:
+    documentclass: article
+    classoption: titlepage
+    papersize: a4
+    geometry: margin=1in
+    fontsize: 12pt
+    number-sections: true
+    toc: true
+    linestretch: 2
+    include-in-header:
+      text: |
+        \usepackage{setspace}
+        \usepackage{etoolbox}
+        % Single-space the reference list even though the body is double-spaced.
+        \AtBeginEnvironment{CSLReferences}{\setstretch{1}}
+        % Smaller font for table notes (kableExtra threeparttable / longtable).
+        \usepackage{threeparttable}
+        \usepackage{threeparttablex}
+        \AtBeginEnvironment{tablenotes}{\scriptsize}
+        \AtBeginEnvironment{TableNotes}{\scriptsize}
+        % Unmarked footnote (no number/superscript) for the AI-use declaration.
+        \newcommand\blfootnote[1]{%
+          \begingroup
+          \renewcommand\thefootnote{}\footnote{#1}%
+          \addtocounter{footnote}{-1}%
+          \endgroup
+        }
+    fig-pos: "H"
+    link-citations: true
+    colorlinks: true
+    linkcolor: blue
+fig-cap-location: top
+tbl-cap-location: top
+bibliography: references.bib
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(scales)
+source(file.path("C:/Users/Juliana/Documents/LSE_ASD_JA/Capstone/2. Coding", "00_setup.R"))
+library(fixest)
+library(HonestDiD)
+library(kableExtra)
+
+knitr::opts_chunk$set(fig.width = 8, fig.height = 5)
+
+df <- readRDS(file.path(data_final, "final_panel_2010_2023_treatment.rds"))
+
+outcome  <- "pro_he"
+ref_year <- 2013
+dept     <- if ("cod_dep" %in% names(df)) "cod_dep" else "departamento"
+
+n_mpio        <- length(unique(df$cod_mpio))
+n_mpio_treat  <- length(unique(df$cod_mpio[df$treat_presence == 1]))
+n_mpio_ctrl   <- length(unique(df$cod_mpio[df$treat_presence == 0]))
+yr_min        <- min(df$year, na.rm = TRUE)
+yr_max        <- max(df$year, na.rm = TRUE)
+
+# Effective estimation sample: municipality-years and unique municipalities that
+# actually enter the weighted baseline DID (the exact spec fit in @sec-static-did).
+# Smaller than the full panel because municipalities with no valid pro_he or an
+# undefined pre-period weight (w_takers) drop out of the WLS.
+m_sample     <- feols(as.formula(sprintf("%s ~ did_presence | cod_mpio + %s^year", outcome, dept)),
+                      data = df, weights = ~w_takers)
+n_obs_est    <- nobs(m_sample)
+n_mpio_est   <- length(fixef(m_sample)$cod_mpio)
+
+# Helper: tidy event-study coefficients from a feols model
+
+tidy_es <- function(model, ref_year, group_var = NULL) {
+  ct <- as.data.frame(coeftable(model))
+  ci <- as.data.frame(confint(model))
+  ct$term    <- rownames(ct)
+  ct$ci_low  <- ci[ct$term, 1]
+  ct$ci_high <- ci[ct$term, 2]
+
+  ct <- ct[grepl("^year::", ct$term), , drop = FALSE]
+  ct$year <- as.integer(sub("^year::([0-9]{4}).*$", "\\1", ct$term))
+
+  if (!is.null(group_var)) {
+    ct$group <- sub(paste0(".*", group_var, ":*"), "", ct$term)
+  } else {
+    ct$group <- "treated"
+  }
+
+  out <- data.frame(
+    year = ct$year, group = ct$group,
+    estimate = ct[["Estimate"]], ci_low = ct$ci_low, ci_high = ct$ci_high,
+    stringsAsFactors = FALSE
+  )
+  refs <- data.frame(
+    year = ref_year, group = unique(out$group),
+    estimate = 0, ci_low = 0, ci_high = 0, stringsAsFactors = FALSE
+  )
+  rbind(out, refs)
+}
+
+plot_es <- function(df_es, title, ref_year, grouped = FALSE, pct = TRUE,
+                     y_lab = sprintf("Effect on immediate HE\ntransition rate (rel. to %d)", ref_year)) {
+  p <- ggplot(df_es, aes(x = year, y = estimate)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "#121313") +
+    add_ceasefire_line(ref_year) +
+    theme_capstone() +
+    theme(axis.title.y = element_text(size = rel(0.8))) +
+    labs(title = title, x = "Year",
+         y = y_lab)
+
+  # Fixed vertical scale for percentage-scale event studies: gridlines every 2 pp.
+  if (pct) p <- p + scale_y_continuous(labels = scales::percent,
+                                       breaks = seq(-0.04, 0.04, 0.02))
+
+  if (grouped) {
+    p <- p + aes(colour = group) +
+      geom_point(position = position_dodge(width = 0.5), size = 2.5) +
+      geom_errorbar(aes(ymin = ci_low, ymax = ci_high),
+                    width = 0.2, position = position_dodge(width = 0.5)) +
+      scale_colour_manual(values = farc_palette,
+                           labels = c(low = "Low", high = "High")) +
+      labs(colour = "FARC intensity")
+  } else {
+    p <- p +
+      geom_point(size = 2.5, colour = farc_palette[["High"]]) +
+      geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.2,
+                    colour = farc_palette[["High"]])
+  }
+
+  # Zoom the y-axis to [-4%, +4%] for all percentage-scale event studies.
+  # coord_cartesian clips (does not drop) any point/interval outside the window.
+  if (pct) p <- p + coord_cartesian(ylim = c(-0.04, 0.04))
+
+  p
+}
+
+# pre-trends: coefficients 2010, 2011, 2012 (2013 omitted)
+pre_years <- 2010:(ref_year - 1)
+pre_pat   <- paste(pre_years, collapse = "|")
+
+wald_pre <- function(model, var) {
+  w <- fixest::wald(model, paste0("year::(", pre_pat, "):", var))
+  tibble(F_stat = as.numeric(w["stat"]), df1 = as.numeric(w["df1"]),
+         df2 = as.numeric(w["df2"]), p_value = as.numeric(w["p"]))
+}
+
+# extract one term from a feols -> tidy row in percentage points
+grab <- function(model, term, label) {
+  ct <- as.data.frame(coeftable(model))
+  tibble(
+    Specification = label,
+    `ATT (pp)`    = 100 * ct[term, "Estimate"],
+    `SE (pp)`     = 100 * ct[term, "Std. Error"],
+    `p-value`     = ct[term, "Pr(>|t|)"]
+  )
+}
+
+wald_pre <- function(model, var) {
+  pre_years <- (min(df$year, na.rm = TRUE)):(ref_year - 1)
+  pre_pat   <- paste(pre_years, collapse = "|")
+  w <- wald(model, paste0("year::(", pre_pat, "):", var))
+  tibble(F_stat = as.numeric(w["stat"]), df1 = as.numeric(w["df1"]),
+         df2 = as.numeric(w["df2"]), p_value = as.numeric(w["p"]))
+}
+```
+
+\newpage
+
+# Abstract {-}
+\begin{spacing}{1}
+
+Existing evidence shows that Colombia's post-conflict violence reduction improved primary- and secondary-school outcomes, but whether these gains reached higher education is unknown. This dissertation provides, to my knowledge, the first evidence on how the reduction in violence following the country's 2014 FARC ceasefire affected immediate access to higher education. Using a municipality-year panel combining conflict, education, public-finance, and coca-cultivation data, I estimate a difference-in-differences model comparing immediate higher-education transition rates across municipalities with different levels of prior FARC exposure, before and after the ceasefire. Pooling any exposure, the average effect is null. Disaggregating by intensity, the transition rate fell in the most heavily exposed municipalities, the opposite of a peace dividend, by about 1.6 percentage points. This estimate is robust to alternative specifications and comparison groups but does not survive a modest violation of parallel trends, so it is read as suggestive rather than robust. A rate decomposition shows the decline is not a fall in absolute access: the pool of exam-takers (denominator) grew faster than the number entering higher education (numerator). The one genuine shortfall in absolute access concentrates in the smallest, most heavily exposed municipalities and falls hardest on women. Coca cultivation, differences in local fiscal capacity, a generic conflict-zone effect, and a post-ceasefire security vacuum are each ruled out. The pattern instead points to a supply-side absorption constraint in which higher-education provision did not expand quickly enough to absorb the growing number of secondary graduates in small, remote post-conflict municipalities, with implications for the geographic targeting of post-conflict education policy.
+\end{spacing}
+
+**Keywords:** *Post-conflict, Higher education access, Human capital, Colombia, Difference-in-differences*.
+
+```{r intro-stats}
+#| include: false
+# Headline statistics reported inline in the Introduction, computed here so the
+# figures are the live model estimates (same specifications as the static DiD
+# and the sex-heterogeneity sections)
+i_fe <- sprintf("cod_mpio + %s^year", dept)
+i_ct <- function(m, t) { x <- as.data.frame(coeftable(m)); c(est = 100 * x[t, "Estimate"], p = x[t, "Pr(>|t|)"]) }
+i_bin  <- i_ct(feols(as.formula(sprintf("pro_he ~ did_presence | %s", i_fe)), data = df, weights = ~w_takers, cluster = ~cod_mpio), "did_presence")
+i_arms <- feols(as.formula(sprintf("pro_he ~ did_low + did_high_u | %s", i_fe)), data = df, weights = ~w_takers, cluster = ~cod_mpio)
+i_low  <- i_ct(i_arms, "did_low")
+i_high <- i_ct(i_arms, "did_high_u")
+i_cont <- i_ct(feols(as.formula(sprintf("pro_he ~ did_cont | %s", i_fe)), data = df, weights = ~w_takers, cluster = ~cod_mpio), "did_cont")
+
+i_sexcols <- grep("^pro_he_[A-Za-z]", names(df), value = TRUE)
+i_takcols <- sub("^pro_he_", "numstudents_", i_sexcols)
+i_dsx <- df |>
+  select(cod_mpio, all_of(dept), year, cease, intensity, all_of(i_sexcols), all_of(i_takcols)) |>
+  pivot_longer(c(all_of(i_sexcols), all_of(i_takcols)),
+               names_to = c(".value", "sex"), names_pattern = "(pro_he|numstudents)_(.+)")
+i_wsx <- i_dsx |> filter(year %in% 2010:2014) |> group_by(cod_mpio, sex) |>
+  summarise(w_sex = mean(numstudents, na.rm = TRUE), .groups = "drop")
+i_dsx_hu <- i_dsx |> left_join(i_wsx, by = c("cod_mpio", "sex")) |>
+  filter(is.finite(w_sex) & w_sex > 0, intensity %in% c("unexposed", "high")) |>
+  mutate(treat_h = as.integer(intensity == "high"), did_h = cease * treat_h)
+i_fes <- function(s) feols(as.formula(sprintf("pro_he ~ did_h | %s", i_fe)),
+                           data = filter(i_dsx_hu, sex == s), weights = ~w_sex, cluster = ~cod_mpio)
+i_sxM <- i_ct(i_fes("M"), "did_h")
+i_sxF <- i_ct(i_fes("F"), "did_h")
+```
+
+# Introduction {#sec-intro}
+\blfootnote{**Declaration:** I used AI (Claude, by Anthropic) during the development of this dissertation to improve the template and the presentation of figures and tables, as well as to enhance the grammar and overall quality of the writing. All analysis, results, and interpretations are my own. This dissertation builds upon the research proposal submitted for the MY400: Fundamentals of Social Science Research Design course "Violence Reduction and Access to Higher Education: Post-Conflict Evidence from Colombia". It further develops and expands the original research design, incorporating additional theoretical, methodological, and empirical elements.}
+
+The determinants of human capital accumulation remain a central question in developing countries, particularly in contexts marked by armed conflict and institutional instability. Education, understood as an investment in human capital, plays a central role in promoting development, economic growth, and social mobility by raising income levels and improving labour productivity [@Becker2002; @Mincer1958], and returns to schooling, particularly at the higher-education level, remain significant and have risen over time in most of the world [@PsacharopoulosPatrinos2018; @MontenegroPatrinos2014]. Human capital accumulation, however, is not solely a matter of individual choice and ability. It is shaped by the broader social, economic, and political conditions in which a person grows up and studies [@Attanasio2015]. Armed conflict is among the most disruptive of these conditions, and Colombia's peace agreement process with the Revolutionary Armed Forces of Colombia (FARC) guerrilla offers a natural setting to examine how educational opportunity responds as conflict recedes.
+
+Colombia's internal armed conflict lasted over six decades and is widely documented to have damaged education at the primary and secondary levels [@Soler2016; @FergussonIbanezRiano2020; @MontanoBardalesPalacios2025], with effects that differ by sex, concentrated among male students for dropout and attainment [@RodriguezSanchez2012] and among female students for academic performance [@grueso2024heterogeneous; @SuarezMesaGomez2025]. In December 2014 the government and the FARC guerrilla declared a bilateral ceasefire during ongoing peace negotiations, concluding in the Final Peace Agreement of November 2016. Existing evidence shows this violence reduction raised school retention, attendance, and academic performance in the municipalities most affected by FARC violence [@PremVargasNamen2023; @MontanoBardalesPalacios2025]. 
+
+However, to the best of my knowledge, no study has examined whether these gains extended to the transition into higher education. In particular, the immediate transition, defined as enrolment in the year directly after the school-leaving exam, is especially important because students who move directly from secondary school into higher education are considerably more likely to persist and complete a degree. By contrast, those who delay entry frequently never enrol at all, so a postponed transition often becomes a foregone one rather than merely a delayed one [@BozickDeLuca2005]. This dissertation contributes to filling that gap.
+
+There are two plausible channels through which reductions in violence may affect access to higher education. First, improved security allows students who might otherwise have dropped out to complete secondary school and subsequently pursue higher education. When violence declines, disruptions to schooling become less frequent, attendance improves, and households face fewer security-related barriers to educational attainment [@PenaDorussen2021; @PerillaEtAl2024; @MontanoBardalesPalacios2025]. As a result, a larger pool of students is able to meet the academic requirements for university admission and continue along the educational pipeline. Second, documented improvements in secondary-school academic performance can directly strengthen students’ prospects of admission to higher education, since SABER 11 scores are, in most cases, a formal requirement for entry into Colombian higher-education programmes. This channel operates through the quality rather than the size of the pool of eligible students. By raising academic achievement, violence reduction may increase the likelihood of transition to higher education even among students who would have completed secondary school regardless of the conflict. Higher test scores improve applicants’ competitiveness in admissions processes and can also expand access to scholarships and other forms of financial support tied to academic performance. 
+
+Both channels may have played a role in expanding access to higher education in municipalities that experienced the largest security gains following the ceasefire. Rather than operating independently, these mechanisms may interact and mutually reinforce one another, resulting in higher rates of transition to higher education. Nevertheless, the empirical strategy is only able to provide evidence consistent with the first channel. Evaluating the second mechanism is not feasible, as the data do not allow for the identification of score-induced changes in transition probabilities.
+
+This dissertation aims to answer three related research questions. First, did the reduction in violence following Colombia's 2014 ceasefire affect immediate access to higher education in municipalities exposed to FARC violence? Second, given substantial variation in the intensity of pre-ceasefire violence across affected municipalities, did this effect depend on the degree of a municipality's prior exposure to FARC violence? Finally, considering the heterogeneous effects of conflict on educational outcomes and the distinct ways in which violence shapes educational trajectories for male and female students, did the effect of the ceasefire differ by sex?
+
+The analysis yields two main findings corresponding to the dissertation's research questions. First, when all FARC-exposed municipalities are grouped into a single treatment category, the ceasefire has no detectable average effect on immediate access to higher education. However, this average effect masks substantial heterogeneity. While the estimated effect in municipalities with low levels of pre-ceasefire exposure is statistically indistinguishable from zero (`r sprintf("%.2f", i_low["est"])` percentage points), municipalities with the highest levels of exposure experienced a decline of `r sprintf("%.2f", abs(i_high["est"]))` percentage points in the immediate higher-education transition rate relative to unexposed municipalities. Estimates from a continuous specification using per capita exposure are consistent with this pattern (`r sprintf("%.2f", i_cont["est"])` percentage points). The negative effect for highly exposed municipalities remains under alternative exposure thresholds, when the comparison group is restricted to municipalities not affected by FARC violence, and when major cities are reintroduced into the sample. However, the estimate becomes smaller once the analysis allows for modest departures from the parallel-trends assumption using HonestDiD, making the interpretation of the results as suggestive rather than conclusive. Second, the reduction in the transition rate is considerably larger among female students (`r sprintf("%.2f", i_sxF["est"])` percentage points) than among male students (`r sprintf("%.2f", i_sxM["est"])` percentage points).
+
+Because a decline in immediate transition rates in the municipalities that benefited most from the improvement in security runs counter to the conventional peace-dividend hypothesis, I explore the result further using a triple-difference design and a decomposition of the transition rate into its numerator and denominator components. This analysis shows that the negative effect on the transition rate does not reflect a decline in the absolute number of students entering higher education. Rather, the number of students progressing to higher education remained broadly stable, while the number of students taking the exit examination increased more rapidly, mechanically reducing the transition rate. The only evidence of a decline in absolute access is found in the smallest and most heavily exposed municipalities, where the effect is concentrated among young women. Moreover, the data provide little support for alternative explanations, including increased opportunity costs linked to the coca economy, a generic conflict-area effect, or the emergence of a post-ceasefire security vacuum occupied by other armed groups. Instead, the evidence is more consistent with a supply-side constraint: higher-education provision, largely concentrated in major urban centres, did not expand sufficiently to accommodate the growing number of secondary-school graduates in small and remote post-conflict municipalities. In these settings, the financial and geographic costs of accessing higher education might remain particularly restrictive, especially for women.
+
+This dissertation contributes to the literature in three ways. Empirically, it provides the first evidence, to my knowledge, on the effects of Colombia's post-ceasefire reduction in violence on access to higher education, extending the literature on peace dividends beyond primary and secondary educational outcomes. Essentially, it shows that the educational consequences of the ceasefire were highly heterogeneous. Municipalities with the greatest historical exposure to FARC violence, particularly the smallest, experienced a relative decline in higher-education transitions, with especially large effects among women. These findings point to the importance of geographically targeted, supply-side policies in post-conflict settings. Methodologically, the dissertation combines an intensity-based design with a triple-difference framework and an HonestDiD sensitivity analysis. While the latter cautions against strong claims regarding the magnitude of the level effects, the decomposition analysis provides more credible evidence on the mechanisms and sources of the observed heterogeneity.
+
+The remainder of this dissertation is structured as follows. @sec-litreview reviews the literature on armed conflict, educational outcomes, and access to higher education. @sec-context outlines the institutional and historical background of the Colombian conflict and peace process. @sec-data describes the data sources, variables, and measurement strategies employed in the analysis. @sec-empirical-strategy presents the empirical strategy and identification assumptions. @sec-results reports the main findings, while @sec-robustness presents a series of robustness checks. @sec-mechanisms explores the potential mechanisms underlying the results, and @sec-limitations discusses the dissertation's limitations. Finally, @sec-conclusion concludes by summarising the main findings and considering their broader implications for public policy.
+
+# Literature review {#sec-litreview}
+
+## Education and armed conflict
+
+Education is a key driver of human capital accumulation, with well-documented benefits for earnings, productivity, and long-run growth [@Becker2002; @Mincer1958]. However, access to and investment in education are shaped by more than individual preferences and abilities. Broader social, economic, political, and cultural factors can substantially influence educational opportunities and outcomes [@Attanasio2015].
+
+Armed conflict is one of the most extensively studied disruptions to human capital accumulation. The empirical literature consistently shows that exposure to violence reduces school enrolment, educational attainment, attendance, and academic performance across a wide range of contexts. Studies from Iraq, Bosnia and Herzegovina, Peru, and Rwanda consistently find that conflict exposure leads to lower schooling and lasting human capital losses, often persisting well beyond the end of hostilities [@Diwakar2015; @JurgesEtAl2022; @Swee2015; @Leon2012; @Akresh2008]. More broadly, evidence from Sub-Saharan Africa suggests that while the magnitude of these effects varies across settings, they are concentrated in areas experiencing the most intense violence and tend to be more severe where state capacity is weak [@UnfriedKisKatos2023; @Justino2010].
+
+The mechanisms behind these findings are direct and well identified in the literature: violence damages school infrastructure and displaces students and teachers, raises the opportunity cost of attending school relative to work or migration, and strains the public finances that would otherwise fund education supply [@RodriguezSanchez2012; @SanchezDiaz2005; @CollierEtAl2003; @MontanoBardalesPalacios2025]. Access to higher education depends on this same educational infrastructure and public-finance base, while also requiring students to complete secondary school and achieve sufficient academic performance to meet admission requirements. As a result, the mechanisms through which violence affects primary and secondary education are also likely to influence tertiary enrolment. If anything, these effects may be stronger at the higher-education margin, where progression depends not only on school availability but also on successful educational transitions and academic achievement. Despite this, the literature has focused predominantly on primary and secondary educational outcomes.
+
+Colombia's own sixty-year conflict fits this pattern closely. @Soler2016 finds that municipal exposure to conflict reduced school achievement; @FergussonIbanezRiano2020 show that exposure to *La Violencia* (Colombia's earlier, mid-twentieth-century civil conflict) left a persistent structural-transformation and educational-attainment scar visible decades later and @SuarezMesaGomez2025 document that periods of higher conflict intensity are associated with worse educational outcomes across Colombian municipalities using open administrative data.
+
+While this body of evidence consistently demonstrates the detrimental effects of violence on educational outcomes, evidence also suggests that these effects are not uniform across gender. However, the direction and magnitude of these effects vary across educational outcomes. Evidence on school dropout and educational attainment suggests that exposure to violence disproportionately increases the risk of adverse educational outcomes among males (@RodriguezSanchez2012). In contrast, for females, violence has been linked to lower academic performance and achievement (@grueso2024heterogeneous; @SuarezMesaGomez2025).
+
+## Education in post-conflict contexts
+
+Considerably less evidence exists on educational outcomes when violence recedes, and the findings are mixed. While cross-country evidence suggests that the end of civil war is often followed by improvements in education as institutions recover and households resume investment in human capital [@ChenLoayzaReynalQuerol2008], other studies find that the immediate post-conflict period can bring reductions in educational expenditure and enrolment due to fiscal constraints, weakened institutions, and competing reconstruction priorities [@LaiThyne2007]. Educational recovery after conflict therefore remains context-dependent and likely depends on the speed with which state capacity and household confidence are restored.
+
+Two considerations highlight the importance of educational recovery, and higher-education access in particular. First, cross-national evidence suggests that broader educational access is associated with longer-lasting peace in post-conflict settings, implying that education is not only a consequence of peace but also a potential contributor to its durability [@IshiyamaBreuning2012]. Understanding whether peace processes expand educational opportunities is therefore of clear policy relevance. Second, higher education has been identified as an important, yet under-studied, component of post-conflict recovery because it helps develop the professionals, civil servants, and leaders needed to rebuild institutions and support long-run development [@MiltonBarakat2018]. Together, these arguments suggest that access to higher education is a policy-relevant outcome, rather than simply an extension of the primary and secondary education story.
+
+## The Colombian peace process: empirical evidence
+
+The 2014 ceasefire and subsequent peace process between the Colombian government and the FARC have generated a growing body of research on the effects of conflict reduction. Exploiting differences in municipalities’ pre-ceasefire exposure to FARC violence, existing studies show that the de-escalation affected economic activity, environmental outcomes, health, entrepreneurship, and psychosocial well-being [@MaldonadoEtAl2018; @PremSaavedraVargas2020; @MoraGarciaEtAl2025; @PerillaEtAl2024; @BernalEtAl2024; @BurgessFonseca2020]. This literature is particularly relevant for the present study because it demonstrates that the decline in FARC violence provides a credible and well-established source of quasi-experimental variation for evaluating the consequences of peace.
+
+On education, two studies are particularly relevant. Using variation in municipalities' pre-ceasefire exposure to FARC violence, @PremVargasNamen2023 show that the 2014 ceasefire improved a range of educational outcomes, including dropout, grade repetition, high-school graduation, and standardised test performance, while ruling out several alternative mechanisms. Likewise, @MontanoBardalesPalacios2025 find that the peace process increased school enrolment and reduced dropout in more exposed municipalities, though educational disparities between the most and least affected areas widened. Together, these studies suggest that conflict reduction improved educational outcomes at earlier stages of the educational trajectory, while leaving open the question of whether these gains extended to access to higher education.
+
+# Context {#sec-context}
+
+## Armed conflict and the peace process {#sec-conflict-context}
+
+The Colombian armed conflict is widely regarded as the longest-running and largest armed conflict in the Western Hemisphere [@JusticeForColombia2020]. It began in 1964 with the formation of two guerrilla groups, the FARC and the National Liberation Army (ELN), initially motivated by an ideological programme inspired by communism and the Cuban revolution. 
+
+Over time, the rise of drug trafficking reoriented the conflict around the economic rents it generated [@JusticeForColombia2020; @Richani1997]. @Richani1997 describes this transformation as the emergence of a self-sustaining “war system,” in which control over coca-growing regions and trafficking corridors became a durable source of financing for armed groups. This dynamic is directly relevant to the coca-cultivation mechanism examined in @sec-mechanism-coca, as the geography of coca production closely overlapped with the territorial logic of the conflict. During the 1980s, a third actor, the paramilitary United Self-Defense Forces of Colombia (AUC), entered the conflict to counter guerrilla groups on behalf of landowners, businesses, and drug-trafficking interests. Although the AUC formally demobilised between 2002 and 2006, the process was incomplete and some former members reorganised into successor criminal groups. This experience is directly relevant to the security-vacuum hypothesis explored in @sec-mechanism-vacuum, as it demonstrates that incomplete demobilisation and armed-group reorganisation have previously occurred in the Colombian context.
+
+In 2012 the national government and the FARC began peace negotiations in Havana, leading to a bilateral ceasefire in December 2014 and the Final Peace Agreement in November 2016 [@PremVargasNamen2023; @PerillaEtAl2024]. According to Colombia's Commission for the Clarification of Truth, Coexistence, and Non-Repetition^[Through Legislative Act 01 of 2017 and Decree 588 of 2017, the Commission for the Clarification of Truth, Coexistence and Non-Repetition was created, as a temporary and extrajudicial mechanism of the Comprehensive System of Truth, Justice, Reparation and Non-Repetition, to learn the truth of what happened in the framework of the armed conflict and contribute to the clarification of the violations and infractions committed during it, and offer a broad explanation of its complexity to the whole of society.], between 1995 and 2018 the conflict caused 450,664 deaths, 121,768 forced disappearances, 50,770 kidnappings, 16,238 cases of child recruitment, and 752,964^[These statistics are drawn from the analysis of 112 databases containing more than 8,775,884 records. According to the Commission for the Clarification of Truth, Coexistence, and Non‑Repetition, the true figures could be as much as twice as high when sub‑records are considered] instances of forced displacement. The FARC was responsible for a substantial share of this violence, making the 2014 ceasefire and subsequent peace agreement a major shift in local security conditions, particularly in municipalities where the group had previously been most active [@PremVargasNamen2023].
+
+The end of active fighting, however, did not automatically restore normal civilian and institutional life in the areas most affected by the conflict. Community-level evidence suggests that psychosocial recovery, the rebuilding of trust in public institutions, and the resumption of everyday economic and social activity were gradual and uneven processes rather than immediate consequences of the ceasefire [@BurgessFonseca2020]. This is important for the analysis that follows. Educational responses to the reduction in violence are unlikely to appear as an immediate and uniform shift across municipalities; instead, they may emerge gradually and differ according to local recovery dynamics, a pattern that motivates the event-study approach employed in Section @sec-event-study. Moreover, the recovery of former FARC strongholds may generate spillover effects beyond municipal boundaries, as economic, institutional, and educational improvements extend to neighbouring areas. This possibility is relevant to the identification concerns discussed in Section @sec-limitations.
+
+## Higher education in Colombia {#sec-education-context}
+
+The Colombian education system comprises early childhood education, basic education (five years of primary and four years of lower secondary schooling), upper secondary education (two years), and higher education. At the tertiary level, the students may pursue technical, technological, or university academic programmes at the undergraduate level, as well as postgraduate studies, including specialisations, master’s degrees, and doctorates [@MEN2018b]. Admission to higher-education institutions in Colombia formally requires students to have taken the SABER 11 examination at the end of upper secondary education. As a result, the exam provides a reasonable approximation of the population of potential higher-education entrants, given the absence of publicly available data on secondary-school graduates. 
+
+The distinction the outcome measure draws on matters substantively for rural and formerly conflict-affected municipalities specifically. Technical and technological programmes are shorter, typically cheaper, and more likely to be offered by institutions with a regional or municipal rather than purely urban footprint than the four-to-five-year professional (university) degrees concentrated in Colombia's largest cities. The outcome is constructed to count access to any of the three, rather than only university-level professional enrolment, precisely so that the outcome does not mechanically understate access in municipalities where a technical or technological programme is the realistic higher-education option available. This feature also implies that the outcome is sensitive to local higher-education supply. The department-by-year fixed effects included in the empirical specification are therefore important, as they absorb department-level differences and time-varying trends in higher-education provision that are unrelated to the evolution of the armed conflict.
+
+Following the peace agreement, the Colombian state adopted a policy framework aimed at preventing conflict recurrence, explicitly identifying education, alongside broader social and rural development, as a key instrument for peacebuilding [@GovernmentFARC2016]. Over the past decade, this commitment has been reflected in student-loan programmes, targeted support for high-achieving low-income students, policies designed to ease the transition from secondary to higher education, and efforts to expand educational provision in rural areas [@DNP2014; @DNP2018; @MEN2018a; @MEN2017]. Because these initiatives were implemented nationally rather than targeted at former conflict zones, changes in higher-education access may reflect both the peace process and broader education policies. The empirical strategy therefore incorporates municipality and year fixed effects (@sec-empirical-strategy) to account for common policy changes over time, allowing the estimated effects to be interpreted as differences associated with pre-ceasefire FARC exposure rather than nationwide educational reforms.
+
+# Data {#sec-data}
+
+The empirical analysis draws on three administrative sources, merged into a single municipality-year panel from 2010-2023.
+
+## Armed conflict
+
+The data are drawn from the System on Violence Events in the Colombian Armed Conflict (SIEVCAC), maintained by the National Center for Historical Memory (CNMH).^[SIEVCAC compiles and cross-validates records of conflict-related violence from institutional and social sources through a two-stage identification and classification process, covering eleven modalities of violence. Its Observatory of Memory and Conflict has registered 356,369 violence events between 1958 and 2020, drawn from more than 600 institutional and social sources [@CNMHObservatorio2025].] The database provides municipality-level records of conflict-related events, including targeted killings, terrorist attacks, kidnappings, sexual violence, massacres, forced disappearances, and other forms of violence, together with information on the date of the event and the actors involved. An event is classified as FARC-related whenever the FARC is identified as one of the perpetrators. Events for which no perpetrator can be identified are retained as a separate category and are not attributed to the FARC.
+
+The distribution of these events by type and attribution is reported in @tbl-events: for each of the eleven SIEVCAC categories over the pre-ceasefire window, it gives the total number of events and the share attributable to the FARC, to unidentified perpetrators, and to other armed actors. This distribution motivates which categories enter the exposure basket defined below.
+
+## Higher education access
+
+The Colombian Institute for the Evaluation of Education (ICFES), the agency responsible for administering Colombia's national upper-secondary exit examination (SABER 11), provides anonymised microdata linking individual examination records to subsequent higher-education enrolment. The dataset covers enrolment in technical, technological, and professional programmes and records the year in which enrolment occurred. Given the near-universal participation in SABER 11 among upper-secondary graduates, the data offer comprehensive coverage of the transition into higher education.
+
+The outcome of interest is the municipality-year share of SABER 11 exam-takers who immediately transition to higher education. Specifically, this measure identifies students who enrol in a higher education programme exactly one year after taking the SABER 11 exam. To stabilise the variance of this estimate, observations are weighted by the number of exam takers. However, rather than using the contemporaneous annual count, I use each municipality's average number of exam takers during the pre-ceasefire period (2010-2014). This approach prevents a municipality's weight from changing over time for reasons that may themselves be endogenous to the conflict. For example, displacement could reduce the number of exam takers in a municipality that remained affected by violence, mechanically lowering its weight precisely when the ceasefire began to take effect.
+
+A student's municipality is identified using their municipality of residence at the time of the exam, rather than the location of either the secondary school attended or the higher education institution in which they subsequently enrol. Hence, the outcome captures immediate access to higher education among students originating from a municipality, rather than enrolment in higher education institutions located within that municipality.
+
+## Municipal information
+To examine potential mechanisms, I use municipality-level data on public finances and coca cultivation from the Colombian Territorial Statistics System (TerriData). The public finance variables include local tax revenue and national government transfers, both expressed in constant `r yr_max` Colombian pesos. I also incorporate data on the area under coca cultivation, as larger coca-growing areas have been shown to be associated with higher secondary-school dropout rates [@Angulo2024].
+
+The resulting panel covers `r yr_min`–`r yr_max` and `r n_mpio_est` municipalities, after excluding municipalities with missing or zero population, those with no observed SABER 11 test takers, and the 13 largest cities, which were comparatively less affected by conflict-related violence^[@sec-appendix-cities re-includes these 13 cities and shows the high-exposure result is essentially unchanged.]. Municipalities excluded because they lacked SABER 11 test takers during 2010-2014 are all small, remote jurisdictions located in the departments of Amazonas, Guainía, and Vaupés, none of which was exposed to FARC-related violence. Their exclusion therefore does not affect the treatment-control comparison that identifies the causal effect of interest and is unlikely to materially influence the estimated results.
+
+## Treatment definition {#sec-treatment}
+
+To construct the pre-ceasefire measure of FARC exposure, I aggregate FARC-attributed violent events occurring between 2010 and 2014 across six categories: war actions, terrorist attacks, damage to settlements, selective killings, kidnappings, and antipersonnel mine incidents. Rather than summing all categories recorded in the SIEVCAC registry, this measure focuses on forms of violence most directly associated with FARC's military strategy and territorial control [@restrepo2003dynamics; @richani2013systems]. War actions, terrorist attacks, and damage to settlements account for the largest share of identified FARC events during the period (above 60% of attributed cases @sec-appendix-events). Antipersonnel mines represent a distinctive FARC tactic and are therefore a particularly relevant measure of conflict exposure, especially given evidence that landmine prevalence has substantial negative effects on schooling and human capital investment [@PerillaEtAl2024]. 
+
+The exposure measure is constructed at the municipality level by aggregating these events over the pre-ceasefire period and expressing the resulting count per 10,000 inhabitants^[Population data are obtained from the Colombian National Administrative Department of Statistics (DANE). Using the average municipal population over the exposure window converts each municipality's raw attack count into a rate that is comparable across municipalities of substantially different sizes, ensuring that the measure reflects the intensity of conflict exposure rather than population scale.].
+
+The five violence categories excluded from the exposure-defining basket are omitted because they are either weakly associated with FARC activity, heavily driven by other armed actors, subject to substantial underreporting, or too infrequent during the exposure period to provide a reliable measure of FARC presence. In particular, forced disappearances and sexual violence are predominantly attributed to non-FARC perpetrators, especially paramilitary organisations, and are known to suffer from severe underreporting in the CNMH records [@de2021basta]. Massacres are also excluded because the AUC was responsible for the vast majority of such events, and post-ceasefire differences in massacre rates between exposed and non-exposed municipalities are statistically indistinguishable from zero. Property damage is excluded because the number of attributable events is too small to provide meaningful variation (@sec-appendix-events).
+
+Importantly, excluding these categories from the exposure measure does not imply that they are ignored in the analysis. As shown in Section @sec-violence-reduction, all eleven SIEVCAC violence categories declined more sharply in exposed municipalities following the ceasefire, providing reassurance that the exposure measure captures a genuine FARC-specific improvement in security rather than an artefact of category selection. Moreover, Section @sec-mechanism-vacuum examines potential replacement violence using the non-FARC-attributed components of all violence categories, not only those included in the main exposure basket.
+
+```{r tbl-treatment}
+#| tbl-cap: "Treatment status by municipality"
+#| include: false
+group_tab <- tibble(
+  Group = c("Unexposed (control)", "FARC-exposed (treated)"),
+  Municipalities = c(n_mpio_ctrl, n_mpio_treat),
+  `Share of sample` = scales::percent(c(n_mpio_ctrl, n_mpio_treat) / n_mpio, accuracy = 0.1)
+)
+```
+
+The primary treatment indicator used throughout this dissertation is *Farc presence*, a binary indicator equal to 1 for municipalities that experienced at least one FARC-attributed attack between 2010-2014 (`r n_mpio_treat` municipalities), and 0 otherwise  (703 municipalities). To examine treatment heterogeneity, I use two alternative measures of exposure intensity. The first is a three-category classification that distinguishes between unexposed, low-exposure, and high-exposure municipalities, with exposed municipalities split at the median number of per-capita attacks. The second is a continuous measure based on the logarithm of the number of FARC-attributed attacks.
+
+@fig-treatment-map displays the three-category measure of FARC exposure across Colombia's municipalities. Exposure is not randomly distributed but concentrated in the guerrilla's historic strongholds in the southern and eastern periphery. Low-exposure municipalities largely surround these high-exposure areas. This spatial clustering is important for the identification strategy, as it shapes the treatment-control comparison and motivates the discussion of potential spillovers and the Stable Unit Treatment Value Assumption (SUTVA) violations in @sec-limitations.
+
+```{r fig-treatment-map}
+#| fig-cap: "FARC exposure intensity by municipality."
+#| fig-height: 8
+library(sf)
+map_geo <- st_read(file.path(data_mun, "mpio.geojson"), quiet = TRUE) |>
+  mutate(cod_mpio = str_pad(as.character(MPIO_CDPMP), 5, pad = "0"))
+map_xs <- readRDS(file.path(data_final, "exposure_crosssection.rds")) |>
+  mutate(cod_mpio = str_pad(as.character(cod_mpio), 5, pad = "0"))
+main_cities <- c("11001","05001","76001","08001","13001","68001",
+                 "17001","52001","66001","54001","73001","23001","50001")
+map_df <- map_geo |>
+  left_join(sf::st_drop_geometry(map_xs) |> select(cod_mpio, intensity), by = "cod_mpio") |>
+  mutate(intensity = as.character(intensity),
+         # dropped municipalities (13 largest cities + any unmatched) -> blank
+         intensity = ifelse(cod_mpio %in% main_cities | is.na(intensity), "Dropped", intensity),
+         intensity = factor(intensity, levels = c("unexposed", "low", "high", "Dropped"),
+                            labels = c("Unexposed", "Low", "High", "Dropped")))
+ggplot(map_df) +
+  geom_sf(aes(fill = intensity), colour = "grey30", linewidth = 0.08) +
+  scale_fill_manual(values = c("Unexposed" = "#e1e0d9",
+                               "Low"     = farc_palette[["Low"]],
+                               "High"    = farc_palette[["High"]],
+                               "Dropped" = "white"),
+                    name = "FARC intensity",
+                    breaks = c("Unexposed", "Low", "High")) +
+  theme_void(base_size = 11) +
+  labs(caption = paste("Note: FARC-exposure intensity by municipality, used as the treatment in the analysis.", 
+  "\nExposed municipalities are those with at least one FARC-attributed attack during 2010-2014.",
+  "\nThe low/high split is the median of FARC attacks per 10,000 inhabitants among exposed municipalities over that window.",
+  "\nThe 13 largest cities, dropped from the analysis, are left blank.") )+
+  theme(legend.position = c(0.16, 0.18),
+        plot.background = element_rect(fill = "white", colour = NA),
+        legend.title = element_text(face = "bold", colour = "#0b0b0b"),
+        legend.text = element_text(colour = "#52514e"))
+```
+
+## Did the ceasefire actually reduce violence? {#sec-violence-reduction}
+
+Before turning to the effects on higher education, it is necessary to establish that the 2014 ceasefire generated a meaningful reduction in violence in municipalities previously exposed to FARC activity. This first-stage validation is central to the identification strategy, as any effect on educational outcomes would be expected to operate through improvements in local security conditions.
+
+@tbl-violence-reduction reports, for each of the eleven violence categories recorded in the SIEVCAC registry, the average number of events per municipality-year before (2010-2014) and after (2015-2023) the ceasefire, separately for FARC-exposed and unexposed municipalities. It also reports tests of whether the change over time differs significantly between the two groups, thereby assessing whether exposed municipalities experienced a larger post-ceasefire decline in violence.
+
+```{r tbl-violence-reduction}
+#| tbl-cap: "Violence reduction after the ceasefire by FARC exposure"
+violence_cats <- c(
+  WA = "War actions",        DP = "Damage to settlements",
+  AS = "Selective murders",  AT = "Terrorist attacks",
+  DB = "Damage to property", DF = "Forced disappearance",
+  MI = "Antipersonnel mines",MA = "Massacres",
+  RU = "Recruitment",        SE = "Kidnappings",
+  VS = "Sexual violence"
+)
+
+did_pvalue <- function(outcome_var, data) {
+  fml <- as.formula(sprintf("%s ~ treat_presence*cease", outcome_var))
+  m <- feols(fml, data = data, cluster = ~cod_mpio)
+  pvalue(m)["treat_presence:cease"]
+}
+
+safe_pct_change <- function(pre, post) if (pre == 0) NA_real_ else (post - pre) / pre
+
+build_violence_row <- function(code, label, metric, suffix, data) {
+  var1 <- paste0(suffix, "_", code, "_1")
+  var0 <- paste0(suffix, "_", code, "_0")
+  tmp  <- data[[var1]] + data[[var0]]
+
+  means <- tibble(treat_presence = data$treat_presence, cease = data$cease, value = tmp) |>
+    group_by(treat_presence, cease) |>
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+  g0_pre  <- means$mean_value[means$treat_presence == 0 & means$cease == 0]
+  g0_post <- means$mean_value[means$treat_presence == 0 & means$cease == 1]
+  g1_pre  <- means$mean_value[means$treat_presence == 1 & means$cease == 0]
+  g1_post <- means$mean_value[means$treat_presence == 1 & means$cease == 1]
+
+  data_tmp <- data |> mutate(.tmp_outcome = tmp)
+
+  tibble(
+    Category    = sprintf("%s", label, tolower(metric)),
+    `No-FARC pre`  = g0_pre,  `No-FARC post` = g0_post, `No-FARC Δ` = safe_pct_change(g0_pre, g0_post),
+    `FARC pre`     = g1_pre,  `FARC post`    = g1_post, `FARC Δ`    = safe_pct_change(g1_pre, g1_post),
+    `p-value`      = did_pvalue(".tmp_outcome", data = data_tmp)
+  )
+}
+
+violence_reduction_tab <- bind_rows(
+  imap_dfr(violence_cats, ~build_violence_row(.y, .x, "Cases",   "n_eventos", df)),
+)
+
+violence_reduction_tab |>
+  mutate(across(where(is.numeric) & !matches("p-value"), ~round(.x, 3)),
+         `p-value` = ifelse(`p-value` < 0.001, "<0.001", sprintf("%.3f", `p-value`))) |>
+  kbl(booktabs = TRUE, longtable = TRUE) |>
+  kable_styling(latex_options = c("hold_position", "repeat_header"), font_size = 8) |>
+  footnote(general = paste(
+    "Note: Mean cases per municipality-year. Pre refers to the period before the ceasefire (2010-2014), while Post refers to the period after the ceasefire (2015-2023). \\\\",
+    "P-value tests whether the change differs by exposure group",
+    "(FARC exposure × post-ceasefire interaction, clustered by municipality).\\\\",
+    "NA: zero pre-period incidence."),
+  general_title = "", escape = FALSE, threeparttable = TRUE)
+```
+
+Violence fell in both groups after 2014, consistent with a national, not purely local, de-escalation, but the decline is far steeper in FARC-exposed municipalities across almost every category, and the group-difference is statistically significant for the large majority of them. War actions, for instance, fell from an average of 3.8 to 0.6 cases per municipality-year in exposed municipalities (an 83% decline) against an essentially flat 0.03 to 0.05 in unexposed municipalities. This validates that the treatment measures are tracking a real, differential change in local security conditions around the 2014 ceasefire, which is the premise the rest of the empirical strategy depends on.
+
+## Ethical considerations {#sec-ethics}
+
+This dissertation relies exclusively on anonymised and aggregated data. The SABER 11 examination records contain no personal identifiers, while the remaining data sources, including conflict events (SIEVCAC), municipal public finances (TerriData), population statistics, and coca cultivation data, are publicly available in aggregated form. Their use for academic research is permitted under the terms established by the respective data providers and does not require additional authorisation. For the purposes of the analysis, all examination records are further aggregated to the municipality-year level, eliminating any possibility of identifying individual students and ensuring compliance with good practices in the handling of sensitive information.
+
+Moreover, the research proposal was submitted through the LSE Research Ethics Submission System prior to the data analysis. Given the nature of the data, which are fully anonymised and aggregated, no further ethical approval was required.
+
+# Empirical strategy {#sec-empirical-strategy}
+
+This paper exploits the onset of the permanent unilateral FARC ceasefire in December 2014 as a common nationwide shock that differentially affected Colombian municipalities according to their pre-existing exposure to the armed conflict. Because the ceasefire occurred simultaneously across the country, identification does not rely on variation in treatment timing. Instead, it exploits cross-sectional differences in municipalities' historical exposure to FARC violence, an empirical strategy that has become common in studies evaluating the effects of the Colombian peace process, as discussed in @sec-litreview.
+
+The analysis is conducted at the municipality level by exam-takers cohort. For each cohort, the outcome $PropHE_{mt}$ measures the proportion of Saber 11
+examinees in municipality $m$ and cohort year $t$ who enrol in higher
+education during the subsequent academic year. 
+
+Because access is measured in $t+1$, the cohort that sits the exam in 2013 makes its enrolment decision in early 2014, before the December 2014
+ceasefire, and is therefore the last fully pre-treatment cohort; the 2014
+cohort, enrolling in 2015, is the first treated cohort. Accordingly, the
+post-ceasefire indicator switches on at cohort year 2014 and `r ref_year` is the omitted reference period throughout. The baseline  specification defines treatment as a binary indicator $FARC_m$ equal to one for municipalities that experienced any FARC-attributed attack during the pre-ceasefire window (2010–2014). The identifying variation comes from comparing changes in higher-education access after the ceasefire between historically FARC-exposed and unexposed municipalities.
+
+The identification follows a common-timing, two-way fixed-effects difference-in-differences. I report two complementary versions. The static specification (@eq-static) pools the entire post-ceasefire period into a single average treatment effect on the treated (ATT):
+$$
+PropHE_{mt} = \alpha_m + \lambda_{d(m),t}
++ \delta \left(FARC_m \times Post_t\right) + \varepsilon_{mt},
+$${#eq-static}
+
+where $Post_t = \mathbf{1}\{t \geq 2014\}$, $\alpha_m$ are municipality fixed effects, and $\lambda_{d(m),t}$ are department-by-year fixed effects. The coefficient $\delta$ is the average post-ceasefire change in access in exposed relative to unexposed municipalities.
+
+The dynamic (event-study) specification (@eq-eventstudy) replaces the single post indicator with a full set of cohort-year interactions:
+$$
+PropHE_{mt} = \alpha_m + \lambda_{d(m),t} + \sum_{k \neq 2013} \beta_k
+\left(FARC_m \times \mathbf{1}\{t = k\}\right) + \varepsilon_{mt}.
+$${#eq-eventstudy}
+
+Both models are estimated using weighted least squares (WLS), with weights based on the average number of Saber 11 exam-takers in each municipality during the pre-ceasefire period (2010-2014). Standard errors are clustered at the municipality level. Municipality fixed effects absorb all time-invariant differences across municipalities, including historical educational attainment, geographic characteristics, and long-run conflict exposure. Department-by-year fixed effects account for region-specific shocks that affect all municipalities within a department, such as macroeconomic conditions and nationwide changes in higher-education policy.
+
+Municipal characteristics that might otherwise serve as covariates, such as coca cultivation, public finances, or population, are plausibly affected by the ceasefire and therefore constitute "bad controls." Conditioning on their post-treatment values would introduce post-treatment bias and alter the estimand of interest. Identification instead relies on the fixed-effects structure and the parallel-trends assumption. Robustness to pre-determined municipal characteristics, whose effects are allowed to vary over time, is assessed separately in @sec-robustness rather than through the inclusion of contemporaneous controls in the baseline specification.
+
+The static $\delta$ is the most compact summary of the effect, but it averages over all post-ceasefire years and so is uninformative about timing. It should be read as an average across the dynamic path rather than as an instantaneous level shift. On the other hand, the dynamic $\beta_k$ trace how the effect evolves, which matters because the educational consequences of a de-escalation need not appear immediately and may build as households and institutions adjust [@autor2003outsourcing].
+
+## Exposure intensity {#sec-strategy-intensity}
+
+The binary design asks only whether any exposure matters. To examine whether the effect varies with the intensity of prior exposure, I use the three-category measure described in @sec-treatment and estimate the event study separately for both groups against the common unexposed comparison group (@eq-threecat):
+$$
+PropHE_{mt} = \alpha_m + \lambda_{d(m),t}
++ \sum_{k \neq 2013} \beta_k^{L}\left(L_m \times \mathbf{1}\{t=k\}\right)
++ \sum_{k \neq 2013} \beta_k^{H}\left(H_m \times \mathbf{1}\{t=k\}\right)
++ \varepsilon_{mt},
+$${#eq-threecat}
+
+where $L_m$ and $H_m$ indicate low and high-exposure municipalities and unexposed municipalities are the omitted category. Each coefficient therefore has a straightforward interpretation: the effect of low or high exposure relative to no exposure. Because both estimates are benchmarked against the same untreated group, they avoid the ambiguity of a "high-versus-rest" specification, in which the control group combines unexposed and low-exposure municipalities.
+
+An alternative is to enter exposure as a continuous regressor, but @CallawayGoodmanBaconSantAnna2025 show that a two-way fixed-effects estimand with a continuous treatment is a non-convex weighted average of the underlying causal responses, and that interpreting variation across dose levels as a causal dose-response requires a parallel-trends assumption strong enough to rule out selection bias between municipalities exposed at different intensities. Estimating a separate group-wise effect against a common untreated comparison, as above, is the interpretable strategy those authors recommend over imposing a linear dose response. I nonetheless report a continuous specification as a descriptive complement, read only as evidence on the sign of any dose-response rather than as a point-identified causal estimator. A fully nonparametric continuous-treatment estimator, recovering the dose response ATT in the sense of @CallawayGoodmanBaconSantAnna2025, is left to future work. The estimators currently available for this approach^[See https://bcallaway11.github.io/contdid/ ] do not support the department-by-year fixed effects and the examinee-based weighting scheme used throughout this dissertation. Both features are central to the identification strategy, making the existing implementations unsuitable to the empirical design considered here.
+
+Throughout the analysis, standard errors are clustered at the municipality level to account for serial correlation in outcomes within municipalities over time, following the recommendations of @bertrand2004much. 
+
+## Identifying assumptions
+
+The validity of the design relies on two assumptions, parallel trends and no anticipation. First, the parallel trends assumption means that absent the ceasefire, FARC-exposed and unexposed municipalities would have followed parallel trends in higher education enrolment. Following standard practice in the DiD literature [@bertrand2004much], this assumption is assessed by examining the event-study coefficients for the pre-treatment cohorts. Statistically insignificant pre-treatment coefficients provide evidence that municipalities with and without historical FARC presence followed comparable trends before the ceasefire. 
+
+This dissertation presents (i) raw weighted trend plots by treatment group, (ii) the event-study coefficients $\beta_\tau$ for $\tau < `r ref_year`$, tested jointly via a Wald test, and (iii) following the critique that a pre-trends test is evidence of credibility rather than proof of validity, both in @PremVargasNamen2023's own robustness approach and in the broader recent DID methodology literature [@RothSantAnnaBilinskiPoe2023], a @RambachanRoth2023 (HonestDiD) sensitivity analysis reporting how large a violation of parallel trends (relative to the largest observed pre-trend) the result can tolerate before the confidence interval covers zero.
+
+Regarding no anticipation, higher-education access in exposed municipalities should not have responded before the ceasefire took effect. This is plausible because the December 2014 ceasefire remained uncertain despite ongoing negotiations, giving municipalities little reason to adjust behaviour in advance.
+
+## Mechanisms: a triple-difference design {#sec-strategy-mechanisms}
+
+The specifications above estimate the average effect of high exposure and how it evolves over time (event-study). The mechanism analysis presented in @sec-mechanisms examines whether the effect is homogeneous across exposed municipalities or instead concentrated in those with particular pre-ceasefire characteristics, such as population size, coca cultivation, or fiscal capacity. To address this question, I employ a triple-difference design (@eq-ddd) following the approach of @PremVargasNamen2023.
+
+Let $Z_m$ denote a pre-determined, time-invariant municipal moderator measured over the pre-ceasefire window such as the log of population, an indicator for pre-ceasefire higher coca cultivation, indicator of above-median fiscal capacity, including national transfers, fiscal revenue and total expenditure. The specification is:
+
+$$
+\begin{aligned}
+PropHE_{mt} = {} & \alpha_m + \lambda_{d(m),t}
++ \beta_1\left(FARC_m \times Post_t\right) \\
+& + \beta_2\left(FARC_m \times Post_t \times Z_m\right)
++ \beta_3\left(Post_t \times Z_m\right)
++ \varepsilon_{mt},
+\end{aligned}
+$$ {#eq-ddd}
+
+where $FARC_m$ indicates FARC exposure measure and $Post_t = \mathbf{1}\{t \geq 2014\}$. The municipality fixed effects $\alpha_m$ absorb the time-invariant levels of $FARC_m$ and $Z_m$, and the department-by-year fixed effects $\lambda_{d(m),t}$ absorb $Post_t$, so only the three interaction terms are identified.
+
+The coefficient of interest is $\beta_2$, the triple difference. It measures how the FARC exposure effect on immediate higher education access changes with the moderator. $\beta_1$ recovers the FARC exposure effect at the reference value of the moderator ($Z_m = 0$), the effect at an average-sized municipality when $Z_m$ is standardised log population, or the effect in the low-$Z$ group when $Z_m$ is a binary indicator, while $\beta_2$ gives the additional effect associated with a one-unit (for continuous $Z_m$, one-standard-deviation) increase in the moderator. The third term, $Post_t \times Z_m$, lets municipalities with different values of $Z_m$ follow their own post-ceasefire path, so that $\beta_2$ isolates variation in the treatment effect rather than in the moderator's own trajectory.
+
+Two features make this the appropriate design here. First, the moderators enter as pre-ceasefire baselines interacted with time, not as contemporaneous controls. Treating them as fixed, pre-determined characteristics avoids the post-treatment ("bad control") bias, since their post-ceasefire values are themselves plausibly affected by the ceasefire. Second, and more important for interpretation, the triple difference is more robust than the level effect it decomposes. Because $\beta_2$ compares the treatment effect across municipalities that share the same department-by-year shocks and differ only in $Z_m$, it nets out the municipality-level differential trends that threaten the parallel-trends assumption for the level of the effect (see @sec-honestdid).
+
+# Results {#sec-results}
+
+## Descriptive patterns {#sec-descriptives}
+```{r tbl-descriptives}
+#| tbl-cap: Pre-ceasefire (2010-2014) municipality characteristics by treatment status
+
+desc_tab <- df |>
+  filter(year <= ref_year) |>
+  group_by(treat_presence) |>
+  summarise(
+    `Mean pro_he (pre-period)` =
+      round(
+        weighted.mean(
+          pro_he[!is.na(pro_he) & !is.na(w_takers)],
+          w_takers[!is.na(pro_he) & !is.na(w_takers)]
+        ),
+        3
+      ),
+    `Mean exam-takers` = round(mean(numstudents, na.rm = TRUE), 3),
+    `Mean population` = round(mean(poblacion, na.rm = TRUE), 3),
+    `Mean coca crops (ha)` = round(mean(coca_crops, na.rm = TRUE), 3),
+    .groups = "drop"
+  ) |>
+  mutate(
+    treat_presence = ifelse(
+      treat_presence == 1,
+      "FARC-exposed",
+      "Unexposed"
+    )
+  ) |>
+  pivot_longer(
+    cols = -treat_presence,
+    names_to = "Variable",
+    values_to = "Value"
+  ) |>
+  pivot_wider(
+    names_from = treat_presence,
+    values_from = Value
+  )
+
+kbl(
+  desc_tab,
+  booktabs = TRUE
+) |>
+  kable_styling(latex_options = "hold_position") |>
+  footnote(general = paste(
+    "Note: Pre-ceasefire municipality means by FARC-exposure group. The higher-education access row is the share of Saber 11 exam-takers who enrol in higher education the following year, weighted by each municipality's 2010-2014 average number of exam-takers; the remaining rows are unweighted municipality averages, with population in inhabitants and coca crops in hectares.",
+    "FARC-exposed municipalities are those with at least one FARC-attributed violent event during the 2010-2014 pre-ceasefire window. The 13 largest cities are excluded from the analysis."),
+    general_title = "", threeparttable = TRUE)
+```
+
+@tbl-descriptives provides municipality descriptive statistics by FARC exposure prior to the ceasefire. FARC-exposed municipalities have higher pre-period higher-education access and more exam-takers than unexposed municipalities. This may seem counterintuitive if exposure is equated with remoteness and deprivation, but it reflects where the FARC operated: exposed municipalities are markedly larger (a mean population of roughly 33,000 versus 20,000) and far more coca-intensive. The FARC concentrated not in the emptiest, most marginal jurisdictions but in mid-sized municipalities of economic and strategic value — coca-growing frontiers and contested corridors whose illicit rents made territorial control worth fighting for [@Richani1997; @AngristKugler2008]. Larger, more economically active municipalities have bigger secondary-school cohorts and more educational provision, which raises both the number of exam-takers and measured transition rates, whereas the unexposed group includes many of the smallest and most remote jurisdictions, such as those in Amazonas, Guainía, and Vaupés, where access is lowest. Exposure is therefore correlated with municipality size and economic activity rather than with the disadvantage one might expect.
+
+None of these baseline differences violate the identifying assumption on its own, what matters for the DiD design is whether the two groups' trends coincide before the ceasefire. The higher baseline level in exposed municipalities, moreover, does not prejudge the sign of the effect: the DiD estimates the change in the gap between the groups after the ceasefire, so a negative estimate means access rose more slowly in exposed than in unexposed municipalities, not that its level is low.
+
+```{r fig-parallel-trends}
+#| fig-cap: "Weighted mean immediate higher-education transition rate by FARC exposure"
+df |>
+  filter(!is.na(pro_he) & !is.na(w_takers)) |>
+  group_by(year, treat_presence) |>
+  summarise(y = weighted.mean(pro_he, w = w_takers), .groups = "drop") |>
+  mutate(treat_presence = factor(treat_presence, levels = c(0, 1),
+                                  labels = c("Unexposed", "FARC-exposed"))) |>
+  ggplot(aes(year, y, colour = treat_presence)) +
+    scale_x_continuous(
+    breaks = seq(2010, 2023, by = 2),
+    limits = c(2010, 2023)
+  ) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  add_ceasefire_line(ref_year) +
+  scale_colour_manual(values = farc_palette) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(colour = NULL, x = NULL, y = "Immediate higher-education transition rate \n(weighted mean)",
+   caption = paste(
+   "Note: Weighted mean immediate higher-education transition rate (share of Saber 11 exam-takers who enrol in higher education the",
+   "\nfollowing year), plotted separately for FARC-exposed and unexposed municipalities.",
+   "\nFARC-exposed municipalities are those with at least one FARC-attributed violent event during the 2010-2014 pre-ceasefire window.",
+   "\n Means are weighted by each municipality's 2010-2014 average number of exam-takers. The dashed vertical line marks the 2013",
+   "\nreference year, the last cohort enrolling before the December 2014 ceasefire.")) +
+  theme_capstone()
+
+
+```
+
+@fig-parallel-trends plots trends for exposed and unexposed municipalities during the period of analysis. The raw weighted trends for exposed and unexposed municipalities move broadly together across the pre-ceasefire period, with the gap between them neither visibly widening nor narrowing before the vertical line marking the ceasefire, an encouraging first look, though, a visual comparison of two aggregate trend lines is not itself a formal test. The event-study specification below, along with its accompanying Wald test, provides a formal test directly.
+
+## Static difference-in-differences {#sec-static-did}
+
+First, I estimate a static two-way fixed-effects DiD that pools the entire post-ceasefire period into a single ATT. This provides the most compact summary of the ceasefire's effect on higher-education access and should be read as an average across those years, not as an instantaneous level shift.
+
+```{r static-did}
+#| include: false
+fe <- sprintf("cod_mpio + %s^year", dept)
+m_pres <- feols(as.formula(sprintf("pro_he ~ did_presence | %s", fe)),
+                data = df, weights = ~w_takers, cluster = ~cod_mpio)
+m_arms <- feols(as.formula(sprintf("pro_he ~ did_low + did_high_u | %s", fe)),
+                data = df, weights = ~w_takers, cluster = ~cod_mpio)
+m_cont <- feols(as.formula(sprintf("pro_he ~ did_cont | %s", fe)),
+                data = df, weights = ~w_takers, cluster = ~cod_mpio)
+
+static_tab <- bind_rows(
+  grab(m_pres, "did_presence", "FARC presence"),
+  grab(m_arms, "did_low",      "Low intensity"),
+  grab(m_arms, "did_high_u",   "High intensity"),
+  grab(m_cont, "did_cont",     "Exposure intensity")
+)
+
+# --- per-cell counts in the ESTIMATION SAMPLE (valid pro_he and w_takers)
+est_df  <- df |> filter(!is.na(pro_he) & !is.na(w_takers))
+n_by    <- est_df |> distinct(cod_mpio, intensity) |> count(intensity)
+gv      <- function(g) { v <- n_by$n[n_by$intensity == g]; if (length(v)) v else 0L }
+n_unexp <- gv("unexposed"); n_low <- gv("low"); n_high <- gv("high")
+
+# municipalities identifying each row (treated group) and reference group
+static_tab <- static_tab |>
+  mutate(
+    `Treated mun.` = c(n_low + n_high, n_low, n_high, n_low + n_high),
+    `Obs`          = c(nobs(m_pres), nobs(m_arms), nobs(m_arms), nobs(m_cont)),
+    `R-squared`    = c(fixest::r2(m_pres, "r2"), fixest::r2(m_arms, "r2"),
+                       fixest::r2(m_arms, "r2"), fixest::r2(m_cont, "r2"))
+  )
+
+# auxiliary table of per-cell sizes
+cell_counts <- est_df |>
+  group_by(intensity) |>
+  summarise(`Municipalities` = n_distinct(cod_mpio),
+            `Obs (mpio-year)` = n(), .groups = "drop") |>
+  mutate(intensity = factor(intensity, levels = c("unexposed","low","high"),
+                            labels = c("Unexposed","Low","High"))) |>
+  rename(Group = intensity)
+
+n_obs   <- nobs(m_pres)
+n_mun   <- length(fixef(m_pres)$cod_mpio)
+b_pres  <- 100 * coef(m_pres)["did_presence"]
+p_pres  <- as.data.frame(coeftable(m_pres))["did_presence", "Pr(>|t|)"]
+b_high  <- 100 * coef(m_arms)["did_high_u"]
+p_high  <- as.data.frame(coeftable(m_arms))["did_high_u", "Pr(>|t|)"]
+b_low  <- 100 * coef(m_arms)["did_low"]
+p_low  <- as.data.frame(coeftable(m_arms))["did_low", "Pr(>|t|)"]
+```
+
+```{r tbl-static-did}
+#| tbl-cap: "Static DID estimates of the effect of FARC exposure on higher-education access"
+static_tab |>
+  mutate(`p-value` = ifelse(`p-value` < 0.001, "<0.001", sprintf("%.3f", `p-value`)),
+         across(c(`ATT (pp)`, `SE (pp)`), ~sprintf("%.2f", .x)),
+         `Obs` = format(`Obs`, big.mark = ","),
+         `R-squared` = sprintf("%.3f", `R-squared`)) |>
+  kbl(booktabs = TRUE, align = c("l", rep("c", 6))) |>
+  kable_styling(latex_options = "hold_position") |>
+  footnote(general = paste(
+    "Note: The outcome is the municipal immediate higher-education transition rate (share of Saber 11 exam-takers who enrol in higher education the following year).",
+    "Each row is a static two-way fixed-effects DiD (ATT in percentage points) with municipality and department-by-year fixed effects, weighted by each municipality's 2010-2014 average number of exam-takers, and with standard errors clustered by municipality.",
+    "The reference group is unexposed municipalities. 'Treated mun.' counts the treated municipalities identifying each coefficient, 'Obs' the municipality-year observations, and 'R-squared' the model fit.",
+    "The final row (exposure intensity) is the continuous log per-capita measure and is reported as descriptive."),
+    general_title = "", threeparttable = TRUE)
+```
+
+Pooling any FARC exposure into a single binary indicator yields an effect on higher-education access of `r sprintf("%.2f", b_pres)` percentage points, statistically indistinguishable from zero. This null effect would suggest the ceasefire left the transition into higher education unchanged. However, the result does not survive disaggregation by exposure intensity. 
+
+The three-category specification shows important differences across exposure levels. Relative to unexposed municipalities, low and high-exposure municipalities exhibit two offsetting patterns. The low-exposure ATT is smaller (`r sprintf("%.2f", b_low)` percentage points) than the binary ATT and remains statistically insignificant. By contrast, the high-exposure ATT is larger (`r sprintf("%.2f", b_high)` percentage points), and statistically significant, suggesting that the negative effect concentrated in the municipalities that were most heavily exposed to FARC violence before the ceasefire. 
+
+The continuous specification, measured as the log of FARC attacks per 10,000 inhabitants, is reported in the final row as a descriptive summary. It is examined dynamically in @fig-event-study-cont, subject to the interpretive caveats discussed by @CallawayGoodmanBaconSantAnna2025 (@sec-empirical-strategy).
+
+## Event-study estimates {#sec-event-study}
+
+The static estimates average effects over the entire post-ceasefire period. To examine treatment dynamics and assess the parallel-trends assumption, I estimate @eq-eventstudy, using `r ref_year`, the last cohort whose enrolment decision predates the December 2014 ceasefire, as the reference year.
+
+```{r fig-event-study}
+#| fig-cap: "Event study: effect of FARC exposure on higher-education access"
+fml_bin <- as.formula(sprintf(
+  "%s ~ i(year, treat_presence, ref = %d) | cod_mpio + %s^year",
+  outcome, ref_year, dept))
+m_bin <- feols(fml_bin, data = df, weights = ~w_takers, cluster = ~cod_mpio)
+
+plot_es(tidy_es(m_bin, ref_year), "Binary FARC exposure treatment", ref_year) +
+  scale_x_continuous(
+    breaks = seq(min(df$year), max(df$year), by = 2),
+    labels = seq(min(df$year), max(df$year), by = 2)
+  ) +
+  labs(caption = paste(
+    "Note: The outcome is the municipal higher-education access rate (share of Saber 11 exam-takers who enrol in higher education",
+    "\nthe following year).Treatment is a binary indicator equal to one for municipalities with any FARC-attributed attack during the 2010-",
+    "\n2014 pre-ceasefire window. Estimates come from a weighted two-way fixed-effects event study with municipality and department-",
+    "\nby-year fixed effects, weighted by each municipality's 2010-2014 average number of exam-takers, with standard errors clustered by", 
+    "\nmunicipality. Points are coefficients relative to the 2013 reference cohort (last cohort enrolling before the December 2014 ceasefire)",
+    "\nand bars are 95% confidence intervals. The dashed vertical line marks the 2013 reference year."))
+```
+```{r pretrends}
+#| include: false
+pt <- wald_pre(m_bin, "treat_presence")
+```
+
+@fig-event-study presents event-study estimates of the effect of any FARC exposure on higher education access. Pre-treatment coefficients are close to zero and statistically insignificant, and the Wald joint test fails to reject the null of parallel trends (p-value = `r round(pt$p_value,3)`), supporting the identifying assumption.
+
+In the post-ceasefire period, the binary-treatment coefficients are mainly negative but statistically insignificant, consistent with the null average treatment effect reported above. Thus, there is no evidence that municipalities exposed to FARC violence experienced a higher-education peace dividend of the kind documented for primary and secondary education [@PremVargasNamen2023]. However, this aggregate null effect may mask important heterogeneity by exposure. To address this possibility, I replace the binary treatment indicator with a continuous measure of FARC exposure, allowing for the estimation of dose-response effects and analysing whether municipalities with higher pre-ceasefire violence levels experienced a differential effect in higher-education access over time.
+
+## Heterogeneity by exposure intensity {#sec-het-intensity}
+
+```{r fig-event-study-cont}
+#| fig-cap: "Event study: effect of FARC exposure intensity on higher-education access"
+
+fml_cont <- as.formula(sprintf(
+  "%s ~ i(year, farc_logint, ref = %d) | cod_mpio + %s^year",
+  outcome, ref_year, dept))
+m_cont <- feols(fml_cont, data = df, weights = ~w_takers, cluster = ~cod_mpio)
+
+plot_es(tidy_es(m_cont, ref_year), "FARC exposure intensity (continous measure)", ref_year) +
+  scale_x_continuous(
+    breaks = seq(min(df$year), max(df$year), by = 2),
+    labels = seq(min(df$year), max(df$year), by = 2)
+  )+
+  labs(caption = paste(
+    "Note: Outcome is the municipal higher-education access rate (share of Saber 11 exam-takers who enrol in higher education the",
+    "\nfollowing year).Treatment is the continuous log per-capita exposure measure, log(1 + FARC attacks per 10,000 inhabitants)",
+    "\naccumulated over 2010-2014. Estimates come from a weighted two-way fixed-effects event study with municipality and department-",
+    "\nby-year fixed effects, weighted by each municipality's 2010-2014 average number of exam-takers, with standard errors clustered ",
+    "\nby municipality. Points are coefficients relative to the 2013 reference cohort (the last cohort enrolling before the December 2014",
+    "\nceasefire) and bars are 95% confidence intervals. The dashed vertical line marks the 2013 reference year."))
+
+```
+
+```{r pretrends-cont}
+#| include: false
+pt_cont <- wald_pre(m_cont, "farc_logint")
+```
+
+@fig-event-study-cont presents event-study estimates for the continuous log per-capita exposure measure. As in the baseline specification, pre-treatment coefficients are close to zero (pre-trends Wald test p-value = `r round(pt_cont$p_value, 3)`), supporting the parallel trends assumption.
+
+The results provide no evidence that municipalities with higher exposure experienced larger gains in higher-education access after the ceasefire. In the immediate post-ceasefire years, the coefficients are negative, indicating lower outcomes in more heavily affected municipalities. Although these effects attenuate over time, they converge toward zero rather than becoming positive. This pattern suggests that the benefits of reduced violence do not increase with exposure intensity. Instead, it points to a non-linear relationship in which the most conflict-affected municipalities face persistent barriers that limit post-conflict improvements in higher-education access.
+
+Because estimates based on the continuous treatment measure are only descriptive and subject to the usual identification caveats associated with continuous-treatment designs, I estimate Equation @eq-threecat, which compares low- and high-exposure municipalities with unexposed municipalities, to assess whether the treatment effect varies with the intensity of exposure.
+
+```{r fig-event-study-intengroup}
+#| fig-cap: "Event study: effect of high and low FARC exposure intensity on higher-education access"
+fml_intg <- as.formula(sprintf(
+  "%s ~ i(year, intensity, ref = %d, ref2 = 'unexposed') | cod_mpio + %s^year",
+  outcome, ref_year, dept))
+m_intg <- feols(fml_intg, data = df, weights = ~w_takers, cluster = ~cod_mpio)
+
+df_int <- tidy_es(m_intg, ref_year, group_var = "intensity")
+df_int$group <- factor(df_int$group, levels = c("low", "high"))
+
+plot_es(df_int, "Low and high FARC exposure relative to unexposed municipalities", ref_year, grouped = TRUE) +
+  scale_x_continuous(
+    breaks = seq(min(df$year), max(df$year), by = 2),
+    labels = seq(min(df$year), max(df$year), by = 2)
+  )+
+  labs(caption = paste(
+    "Note: Outcome is the municipal higher-education access rate (share of Saber 11 exam-takers who enrol in higher education the",
+    "\nfollowing year). Exposed municipalities are split at the median per-capita FARC attack per 10.000 inhabitants (2010-2014) into low-",
+    "\n(green) and high-exposure (red) groups, each compared with the common unexposed group. Estimates come from a weighted two-way",
+    "\nfixed-effects event study with municipality and department-by-year fixed effects, weighted by each municipality's 2010-2014", 
+    "\naverage number of exam-takers, with standard errors clustered by municipality. Points are coefficients relative to the 2013 reference",
+    "\ncohort (the last cohort enrolling before the December 2014 ceasefire) and bars are 95% confidence intervals. The dashed vertical",
+    "\nline marks the 2013 reference year."))
+```
+
+```{r pretrends-intensity}
+#| include: false
+pt_int <- wald_pre(m_intg, "intensity")
+```
+
+The two groups diverge sharply after the ceasefire (@fig-event-study-intengroup). Pre-treatment coefficients for both are small and jointly insignificant (pre-trends Wald test p-value = `r round(pt_int$p_value, 3)`), so both series clear the parallel-trends bar. 
+
+After the ceasefire, municipalities with high FARC exposure exhibit a pronounced and persistent decline in higher-education access, with point estimates reaching roughly 2 percentage points below those of unexposed municipalities in the medium run and remaining negative for several years. By contrast, municipalities with lower exposure experience smaller short-run declines and a faster recovery, with estimates gradually converging toward zero and becoming positive in later periods. However, the estimated effects for both groups are imprecise and statistically insignificant, limiting confidence in these differences.
+
+Consistent with the descriptive evidence based on the continuous measure of conflict exposure, the results suggest that municipalities more heavily affected by violence experienced smaller and slower improvements in immediate access to higher education. This pattern may reflect persistent structural barriers that constrain their ability to translate reductions in violence into improved educational outcomes. Although the individual estimates are not statistically significant, the consistent differences in trends across exposure groups point to potentially meaningful variation in the post-ceasefire adjustment process. The following section assesses whether this adverse pattern among highly exposed municipalities remains robust to potential violations of the parallel trends assumption.
+
+## Heterogeneity by student sex {#sec-het-sex}
+
+The analysis so far pools male and female students. However, the channels through which conflict affects higher-education access, including displacement, income shocks, and the costs of attending institutions located far from home, may differ by gender. Moreover, a large literature suggests that female educational attainment is particularly sensitive to insecurity and mobility constraints. To explore this heterogeneity, I re-estimate the high-exposure specification separately for women and men, using municipality-year outcomes and pre-ceasefire exam-taker weights computed for each sex.
+
+```{r het-sex}
+#| include: false
+sexcols <- grep("^pro_he_[A-Za-z]", names(df), value = TRUE)          # pro_he_F, pro_he_M
+takcols <- sub("^pro_he_", "numstudents_", sexcols)
+
+dsx <- df |>
+  select(cod_mpio, all_of(dept), year, cease, intensity, did_presence,
+         all_of(sexcols), all_of(takcols)) |>
+  pivot_longer(c(all_of(sexcols), all_of(takcols)),
+               names_to = c(".value", "sex"),
+               names_pattern = "(pro_he|numstudents)_(.+)") |>
+  mutate(female = as.integer(sex == "F"))
+wsx <- dsx |> filter(year %in% 2010:2014) |> group_by(cod_mpio, sex) |>
+  summarise(w_sex = mean(numstudents, na.rm = TRUE), .groups = "drop")
+dsx <- dsx |> left_join(wsx, by = c("cod_mpio", "sex")) |>
+  filter(is.finite(w_sex) & w_sex > 0)
+dsx_hu <- dsx |> filter(intensity %in% c("unexposed", "high")) |>
+  mutate(treat_h = as.integer(intensity == "high"), did_h = cease * treat_h)
+
+cfx <- function(m, term) {
+  ct <- as.data.frame(coeftable(m)); nm <- rownames(ct)
+  t  <- if (grepl(":", term)) nm[grepl("did_h", nm) & grepl("female", nm)][1] else term
+  c(est = 100 * ct[t, "Estimate"], p = ct[t, "Pr(>|t|)"])
+}
+fes <- function(s) feols(as.formula(sprintf("pro_he ~ did_h | %s", fe)),
+                         data = filter(dsx_hu, sex == s), weights = ~w_sex, cluster = ~cod_mpio)
+mM <- fes("M"); mF <- fes("F")
+mP <- feols(as.formula(sprintf("pro_he ~ did_h + did_h:female + female:cease | cod_mpio^sex + %s^year", dept)),
+            data = dsx_hu, weights = ~w_sex, cluster = ~cod_mpio)
+sxM <- cfx(mM, "did_h"); sxF <- cfx(mF, "did_h"); sxD <- cfx(mP, "did_h:female")
+
+# extensive margin (any exposure) by sex
+bpres <- function(s) cfx(feols(as.formula(sprintf("pro_he ~ did_presence | %s", fe)),
+                          data = filter(dsx, sex == s), weights = ~w_sex, cluster = ~cod_mpio),
+                         "did_presence")
+sxMp <- bpres("M"); sxFp <- bpres("F")
+
+esx <- function(s) feols(as.formula(sprintf("pro_he ~ i(year, treat_h, ref = %d) | %s", ref_year, fe)),
+                         data = filter(dsx_hu, sex == s), weights = ~w_sex, cluster = ~cod_mpio)
+mMe <- esx("M"); mFe <- esx("F")
+prepat <- paste(min(df$year):(ref_year - 1), collapse = "|")
+prem <- as.numeric(fixest::wald(mMe, paste0("year::(", prepat, "):treat_h"))["p"])
+pref <- as.numeric(fixest::wald(mFe, paste0("year::(", prepat, "):treat_h"))["p"])
+```
+
+The estimates fall more on women (@tbl-het-sex). For male students the high-exposure ATT is `r sprintf("%.2f", sxM["est"])` percentage points and for female students it is `r sprintf("%.2f", sxF["est"])` percentage points, over half again as large. Pooling the two into a single interaction, the female–male difference is `r sprintf("%.2f", sxD["est"])` percentage points and is itself statistically significant, so the gap is not merely a matter of one estimate clearing a significance threshold and the other not. Both series clear their pre-trends test (Wald p-value = `r sprintf("%.2f", prem)` for men, `r sprintf("%.2f", pref)` for women), so the gap does not reflect differential pre-existing trajectories.
+
+```{r tbl-het-sex}
+#| tbl-cap: "ATT on higher-education access by student sex and treatment definition"
+xrow <- function(m, term, label) {
+  ct <- as.data.frame(coeftable(m)); nm <- rownames(ct)
+  t  <- if (grepl(":", term)) nm[grepl("did_h", nm) & grepl("female", nm)][1] else term
+  tibble(Specification = label,
+         Estimate = 100 * ct[t, "Estimate"],
+         SE       = 100 * ct[t, "Std. Error"],
+         `p-value`= ct[t, "Pr(>|t|)"])
+}
+n_high_sex  <- function(s) dsx_hu |> filter(sex == s, intensity == "high", !is.na(pro_he), !is.na(w_sex)) |> distinct(cod_mpio) |> nrow()
+n_high_both <- dsx_hu |> filter(intensity == "high") |> distinct(cod_mpio) |> nrow()
+n_exp_sex   <- function(s) dsx |> filter(sex == s, intensity != "unexposed", !is.na(pro_he), !is.na(w_sex)) |> distinct(cod_mpio) |> nrow()
+mMp <- feols(as.formula(sprintf("pro_he ~ did_presence | %s", fe)), data = filter(dsx, sex == "M"), weights = ~w_sex, cluster = ~cod_mpio)
+mFp <- feols(as.formula(sprintf("pro_he ~ did_presence | %s", fe)), data = filter(dsx, sex == "F"), weights = ~w_sex, cluster = ~cod_mpio)
+
+bind_rows(
+  xrow(mMp, "did_presence", "Any exposure, male (pp)"),
+  xrow(mFp, "did_presence", "Any exposure, female (pp)"),
+  xrow(mM,  "did_h",        "High exposure, male (pp)"),
+  xrow(mF,  "did_h",        "High exposure, female (pp)"),
+  xrow(mP,  "did_h:female", "Female-male gap, high exp. (pp)")
+) |>
+  mutate(`Treated mun.` = c(n_exp_sex("M"), n_exp_sex("F"), n_high_sex("M"), n_high_sex("F"), n_high_both),
+         `Obs`          = c(nobs(mMp), nobs(mFp), nobs(mM), nobs(mF), nobs(mP)),
+         `R-squared`    = c(fixest::r2(mMp, "r2"), fixest::r2(mFp, "r2"), fixest::r2(mM, "r2"), fixest::r2(mF, "r2"), fixest::r2(mP, "r2"))) |>
+  mutate(`p-value` = ifelse(`p-value` < 0.001, "<0.001", sprintf("%.3f", `p-value`)),
+         across(c(Estimate, SE), ~sprintf("%.2f", .x)),
+         `Obs` = format(`Obs`, big.mark = ","),
+         `R-squared` = sprintf("%.3f", `R-squared`)) |>
+  kbl(booktabs = TRUE, align = c("l", rep("c", 6))) |>
+  kable_styling(latex_options = "hold_position", full_width = FALSE) |>
+  column_spec(1, width = "5cm") |>
+  footnote(general = paste(
+    "Note: ATT on the immediate higher-education transition rate by student sex, under two treatment definitions, any FARC exposure (binary, first two rows) and high exposure only (high versus unexposed), each estimated separately for male and female students with municipality and department-by-year fixed effects, weighted by each municipality's 2010-2014 sex-specific average number of exam-takers, and standard errors clustered by municipality.",
+    "The final row is the female-minus-male difference in the high-exposure effect, from a pooled specification that interacts the effect with a female indicator, with municipality-by-sex and department-by-year fixed effects.",
+    "Treated mun. counts the treated municipalities identifying each estimate, 'Obs' the observations, and 'R-squared' the model fit."),
+    general_title = "", threeparttable = TRUE)
+```
+
+```{r fig-het-sex}
+#| fig-cap: "Event study of the high-exposure effect on higher-education access, by student sex."
+tdy <- function(m, var) {
+  ct <- as.data.frame(coeftable(m)); ci <- as.data.frame(confint(m))
+  ct$term <- rownames(ct); ct$lo <- ci[ct$term, 1]; ct$hi <- ci[ct$term, 2]
+  ct <- ct[grepl(paste0("^year::.*:", var, "$"), ct$term), , drop = FALSE]
+  ct$year <- as.integer(sub("^year::([0-9]{4}).*$", "\\1", ct$term))
+  rbind(data.frame(year = ct$year, est = ct[["Estimate"]], lo = ct$lo, hi = ct$hi),
+        data.frame(year = ref_year, est = 0, lo = 0, hi = 0))
+}
+bind_rows(transform(tdy(mMe, "treat_h"), sex = "Male"),
+          transform(tdy(mFe, "treat_h"), sex = "Female")) |>
+  ggplot(aes(year, est, colour = sex)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "#c3c2b7") +
+  add_ceasefire_line(ref_year) +
+  geom_point(position = position_dodge(width = 0.5), size = 2) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.2, position = position_dodge(width = 0.5)) +
+  scale_y_continuous(labels = scales::percent, breaks = seq(-0.06, 0.06, 0.02)) +
+  scale_x_continuous(
+    breaks = seq(min(df$year), max(df$year), by = 2),
+    labels = seq(min(df$year), max(df$year), by = 2)
+  ) +
+  coord_cartesian(ylim = c(-0.06, 0.06)) +
+  scale_colour_manual(values = c(Male = farc_palette[["Unexposed"]], Female = farc_palette[["High"]])) +
+  theme_capstone() +
+  theme(axis.title.y = element_text(size = rel(0.8))) +
+  labs(colour = NULL, x = "Year", y = sprintf("Effect on immediate HE\ntransition rate (rel. to %d)", ref_year),
+       title = "High-exposure effect by student sex",
+       caption = paste(
+         "Note: Outcome is the sex-specific municipal higher-education access rate (share of male or female Saber 11 exam-takers who",
+         "\nenrol in higher education the following year). The event study compares high-exposure municipalities with unexposed municipalities,",
+         "\nestimated separately by student sex. Estimates come from a weighted two-way fixed-effects specification with municipality",
+         "\n and department-by-year fixed effects, weighted by each municipality's 2010-2014 average number of exam-takers of that sex,",
+         "\nwith standard errors clustered by municipality. Points are coefficients relative to the 2013 reference cohort (the last cohort enrolling",
+         "\nbefore the ceasefire) and bars are 95% confidence intervals. The dashed vertical line marks the 2013 reference year."))
+```
+
+The same asymmetry appears at the extensive margin. Pooling any FARC exposure, the ATT on men is indistinguishable from zero (`r sprintf("%.2f", sxMp["est"])` percentage points) while for women it is negative and marginally significant (`r sprintf("%.2f", sxFp["est"])` percentage points). These findings suggest that the binary specification in @sec-static-did masks substantial heterogeneity in treatment effects, particularly with respect to conflict intensity and a gendered penalty that appears to affect some groups more strongly than others.
+
+# Robustness {#sec-robustness}
+
+This section aims to evaluate if the negative high-exposure estimate depends on where the threshold between low and high exposure is drawn, on which municipalities serve as controls, or if it survives to modest violations of the parallel trend assumption (HonestDiD). 
+
+To assess the robustness of the results to alternative treatment definitions and control group compositions, I conduct two robustness checks, each re-estimating @eq-static using the three-category specification. An additional robustness check, which reintroduces the country's main cities into the sample, is reported in @sec-appendix-cities. The benchmark being stress-tested throughout is the three-category high-versus-unexposed ATT of `r sprintf("%.2f", b_high)` percentage points from @sec-static-did.
+
+## Sensitivity to violations of parallel trends (HonestDiD) {#sec-honestdid}
+
+Since a passed pre-trends test is evidence of, rather than proof of, parallel trends [@RothSantAnnaBilinskiPoe2023], and @fig-event-study-intengroup displays a slight pre-ceasefire decline, I use the HonestDiD procedure of @RambachanRoth2023 to evaluate the robustness of the negative ATT for high-exposure municipalities. The method asks how large violations of parallel trends after the ceasefire would have to be, relative to the largest pre-treatment violation, to overturn the result.
+
+```{r fig-honestdid}
+#| fig-cap: "HonestDiD sensitivity of the high-vs-unexposed effect"
+df_hu <- subset(df, intensity %in% c("unexposed", "high"))
+df_hu$treat_high2 <- as.integer(df_hu$intensity == "high")
+fml_hu <- as.formula(sprintf(
+  "%s ~ i(year, treat_high2, ref = %d) | cod_mpio + %s^year",
+  outcome, ref_year, dept))
+m_hu <- feols(fml_hu, data = df_hu, weights = ~w_takers, cluster = ~cod_mpio)
+
+es_vec <- function(model, pattern) {
+  b <- coef(model); V <- vcov(model)
+  idx <- grep(pattern, names(b))
+  yrs <- as.integer(sub(".*year::([0-9]{4}).*", "\\1", names(b)[idx]))
+  o <- order(yrs); idx <- idx[o]
+  list(beta = b[idx], sigma = V[idx, idx, drop = FALSE], years = sort(yrs))
+}
+hu <- es_vec(m_hu, "year::[0-9]{4}:treat_high2")
+numPre  <- sum(hu$years < ref_year)     # with 2010 in the panel: 3 (2010, 2011, 2012)
+numPost <- sum(hu$years > ref_year)
+
+# Report TWO targets so the parameter is not chosen for convenience:
+#   - post-ceasefire average (consistent with a persistent decline)
+#   - first post-period (2014)
+run_rm <- function(l_vec) createSensitivityResults_relativeMagnitudes(
+  betahat = hu$beta, sigma = hu$sigma,
+  numPrePeriods = numPre, numPostPeriods = numPost,
+  Mbarvec = seq(0, 2, by = 0.5), l_vec = l_vec)
+# breakdown = largest Mbar whose robust CI still excludes 0
+breakdown <- function(rm) { ex <- rm[rm$lb > 0 | rm$ub < 0, ]; if (nrow(ex)) max(ex$Mbar) else 0 }
+
+l_avg    <- rep(1 / numPost, numPost)
+l_first  <- basisVector(index = 1, size = numPost)
+rm_avg   <- run_rm(l_avg)
+rm_first <- run_rm(l_first)
+bd_avg   <- breakdown(rm_avg)
+bd_first <- breakdown(rm_first)
+
+original_cs <- constructOriginalCS(
+  betahat = hu$beta, sigma = hu$sigma,
+  numPrePeriods = numPre, numPostPeriods = numPost, l_vec = l_avg)
+
+# Same format as the appendix sex figure (@fig-appx-sex-honest): Original CI vs.
+# robust CI across relative-magnitudes bounds, drawn as error bars.
+hd_plot <- rbind(
+  data.frame(x = "Original", lb = original_cs$lb, ub = original_cs$ub,
+             method = "Original CI"),
+  data.frame(x = as.character(rm_avg$Mbar[rm_avg$Mbar > 0]),
+             lb = rm_avg$lb[rm_avg$Mbar > 0], ub = rm_avg$ub[rm_avg$Mbar > 0],
+             method = "HonestDiD robust CI")
+)
+hd_plot$x <- factor(hd_plot$x, levels = c("Original", "0.5", "1", "1.5", "2"))
+
+ggplot(hd_plot, aes(x = x, colour = method)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "#121313") +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.18, linewidth = 0.6) +
+  geom_point(aes(y = (lb + ub) / 2), size = 2) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_colour_manual(values = c("Original CI" = farc_palette[["Unexposed"]],
+                                 "HonestDiD robust CI" = farc_palette[["High"]])) +
+  theme_capstone() +
+  theme(legend.position = "bottom") +
+  labs(x = expression(paste("Relative-magnitudes bound  ", bar(M))),
+       y = "Effect on immediate HE transition rate \n(average post-ceasefire)",
+       colour = NULL,
+       title = "HonestDiD sensitivity — high vs. unexposed",
+       caption = paste(
+         "Note: Rambachan and Roth (2023) relative-magnitudes sensitivity analysis for the average post-ceasefire high-vs-unexposed",
+         "\neffect on the higher-education access rate. The horizontal axis, Mbar, is the largest post-treatment violation of parallel trends",
+         "\nallowed, expressed as a multiple of the largest violation observed in the pre-treatment period; Mbar = 0 imposes exact parallel",
+         "\ntrends. 'Original CI' is the conventional 95% confidence interval; 'HonestDiD robust CI' is the robust confidence set."))
+```
+  
+
+The sensitivity analysis qualifies rather than confirms the high-exposure result. For the average post-treatment effect and for the first post-treatment period, the robust confidence interval excludes zero only up to $\bar{M} =$ `r sprintf("%.1f", bd_avg)` and `r sprintf("%.1f", bd_first)`, respectively. Both fall below the natural benchmark $\bar{M} = 1$, which allows post-treatment deviations from parallel trends as large as the largest deviation observed in the pre-treatment period. Thus, although the estimated negative effect is statistically significant under conventional inference, it is not robust to even modest violations of the parallel-trends assumption. The result should therefore be interpreted as suggestive rather than definitive. It reflects a pattern in the data that holds under the identifying assumption, but whose credibility depends on the extent to which parallel trends can be deemed plausible in a setting with a small high-exposure group and potential geographic spillovers.
+
+## A stricter threshold for heavy exposure {#sec-alt-threshold}
+
+To assess the sensitivity of the results to the treatment classification, I redefine the low/high exposure threshold at the 75th percentile of the per-capita attack rate among exposed municipalities. Under this alternative specification, the high-exposure group consists of the top quartile of exposed municipalities rather than the top half.
+
+```{r rob-threshold}
+#| include: false
+
+# Rebuild the three-category split at the 75th percentile among EXPOSED municipalities
+
+pos_ex <- df |> 
+  distinct(cod_mpio, attacks_pc) |> 
+  filter(attacks_pc > 0) |> 
+  pull(attacks_pc)
+q75    <- quantile(pos_ex, 0.75, names = FALSE)
+
+df_q <- df |>
+  mutate(intensity75 = factor(case_when(attacks_pc == 0   ~ "unexposed",
+                                        attacks_pc <= q75 ~ "low",
+                                        TRUE              ~ "high"),
+                              levels = c("unexposed","low","high")),
+         did_low75  = cease * as.integer(intensity75 == "low"),
+         did_high75 = cease * as.integer(intensity75 == "high"))
+
+n_high75 <- df_q |> 
+  filter(intensity75 == "high") |> 
+  distinct(cod_mpio) |> 
+  nrow()
+
+# Fitting the model
+m_arms_r <- feols(as.formula(sprintf("pro_he ~ did_low75 + did_high75 | %s", fe)),
+                data = df_q, weights = ~w_takers, cluster = ~cod_mpio)
+
+chk_thr <- grab(m_arms_r, "did_high75", "Top-quartile threshold")
+
+# Clean high-vs-unexposed pre-trends under the stricter threshold
+df_q_hu <- df_q |>
+    filter(intensity75 %in% c("unexposed","high")) |>
+    mutate(th75 = as.integer(intensity75 == "high"))
+
+th75 <- "th75"
+es_arms_r <- feols(as.formula(sprintf("%s ~ i(year, %s, ref = %d) | cod_mpio + %s^year", outcome, th75, ref_year, dept)), data = df_q_hu, weights = ~w_takers, cluster = ~cod_mpio)
+
+pt_thr  <- wald_pre(es_arms_r, "th75")
+
+att_thr <- chk_thr[["ATT (pp)"]]; p_thr <- chk_thr[["p-value"]]; ptp_thr <- pt_thr$p_value
+```
+
+Under the top-quartile threshold, high exposure is identified off `r n_high75` municipalities, and the high-versus-unexposed ATT is `r sprintf("%.2f", att_thr)` percentage points (@fig-robustness-forest), with pre-trends passed (joint Wald pre-trend test p-value = `r sprintf("%.3f", ptp_thr)`). The estimated effect is slightly larger than in the median-split benchmark and remains significant at the 5 percent level. This indicates that the finding is not driven by the choice of the cutoff. Restricting the high-exposure group to the most intensely affected quartile of municipalities strengthens, rather than attenuates, the estimated negative effect, even though the smaller group size leads to wider confidence intervals.
+
+## A non-FARC comparison group {#sec-comparison-group}
+
+A potential concern is that the estimated effect captures a broader post-conflict adjustment common to conflict-affected municipalities, rather than a mechanism specifically linked to the withdrawal of FARC activity. To address this concern, I restrict the comparison group to municipalities that experienced armed violence between 2010 and 2014 but were not exposed to FARC activity, using non-FARC-attributed events from the same six-category conflict measure. This approach excludes municipalities with no conflict exposure and redefines the identifying comparison as one between FARC-exposed municipalities and municipalities affected by other armed actors, following @PremVargasNamen2023.
+
+```{r rob-compgroup}
+#| include: false
+
+nonfarc <- df |>
+  filter(year %in% 2010:2014) |>
+  group_by(cod_mpio) |>
+  summarise(nofarc_tot = sum(total_nofarc_events, na.rm = TRUE), .groups = "drop") |>
+  mutate(nofarc_exposed = as.integer(nofarc_tot > 0))
+
+df_conflict <- df |>
+  left_join(nonfarc, by = "cod_mpio") |>
+  filter(treat_presence == 1 | nofarc_exposed == 1)
+
+n_cg      <- length(unique(df_conflict$cod_mpio))
+n_cg_ctrl <- length(unique(df_conflict$cod_mpio[df_conflict$treat_presence == 0]))
+
+# Fitting the model
+m_nofarc_r <- feols(as.formula(sprintf("pro_he ~ did_low + did_high_u | %s", fe)),
+                data = df_conflict, weights = ~w_takers, cluster = ~cod_mpio)
+
+chk_iii   <- grab(m_nofarc_r, "did_high_u", "Non-FARC comparison group")
+
+# clean high-vs-unexposed pre-trends on the restricted sample
+df_cg_hu  <- df_conflict |> 
+  filter(intensity %in% c("unexposed","high")) |>
+  mutate(thc = as.integer(intensity == "high"))
+
+thc <- "thc"
+es_nofarc_r <- feols(as.formula(sprintf("%s ~ i(year, %s, ref = %d) | cod_mpio + %s^year", outcome, thc, ref_year, dept)), data = df_cg_hu, weights = ~w_takers, cluster = ~cod_mpio)
+
+pt_iii    <- wald_pre(es_nofarc_r, "thc")
+
+att_iii <- chk_iii[["ATT (pp)"]]; p_iii <- chk_iii[["p-value"]]; ptp_iii <- pt_iii$p_value
+```
+
+With the comparison group narrowed to `r n_cg_ctrl` non-FARC-conflict-affected controls (`r n_cg` municipalities in total), the high-exposure ATT is `r sprintf("%.2f", att_iii)` percentage points (@fig-robustness-forest), with pre-trends again passed^[There is insufficient statistical evidence to reject the null hypothesis of parallel trends. The jointWald pre-trend test for the high-exposure category yields a p-value of `r sprintf("%.3f", ptp_iii)`]. The result is therefore unlikely to reflect differences between conflict-affected and conflict-free municipalities. Even relative to municipalities exposed to non-FARC violence over the same period, those with the highest levels of FARC exposure experienced larger declines in immediate access to higher education.
+
+Taken together, the high-exposure estimate is negative in every specification. It remains statistically significant at the 5 percent level when heavy exposure is defined using a stricter top-quartile threshold, when the comparison group is restricted to municipalities affected by non-FARC violence, and when the country's largest cities are reintroduced into the sample (see @sec-appendix-cities). The estimated effect is therefore remarkably stable, both in sign and in magnitude, across the design and sample choices.
+
+What the result does not withstand, however, is even a modest violation of the parallel trends assumption. As shown in @sec-honestdid, the estimated effect loses robustness once plausible violations from parallel trends are allowed. The remaining fragility is therefore tied specifically to the study's identifying assumption. For this reason, the dissertation characterises the high-exposure effect as suggestive and policy-relevant rather than conclusive.
+
+```{r fig-robustness-forest}
+#| fig-cap: "Robustness Checks for the High-Exposure ATT"
+
+base_presence <- grab(m_pres, "did_presence", "Any exposure (binary)")
+base_low      <- grab(m_arms, "did_low",    "Baseline: low vs. unexposed")
+base_high_u   <- grab(m_arms, "did_high_u", "High vs. unexposed")
+base_att <- base_high_u[["ATT (pp)"]]
+base_p   <- base_high_u[["p-value"]]
+
+bind_rows(base_presence, base_high_u, chk_thr, chk_iii) |>
+  mutate(ci_low  = `ATT (pp)` - 1.96 * `SE (pp)`,
+         ci_high = `ATT (pp)` + 1.96 * `SE (pp)`,
+         arm = case_when(grepl("binary", Specification)            ~ "Any (binary)",
+                         grepl("low",  Specification, ignore.case = TRUE) ~ "Low",
+                         TRUE                                       ~ "High"),
+         arm  = factor(arm, levels = c("Any (binary)", "Low", "High")),
+         plab = sprintf("p = %.3f", `p-value`),
+         Specification = fct_rev(fct_inorder(Specification))) |>
+  ggplot(aes(x = `ATT (pp)`, y = Specification, colour = arm)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "#898781", linewidth = 0.4) +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.2) +
+  geom_point(size = 3) +
+  geom_text(aes(label = plab), nudge_y = 0.30, size = 3, colour = "#52514e",
+            show.legend = FALSE) +
+  scale_colour_manual(values = c("Any (binary)" = farc_palette[["Unexposed"]],
+                                 "Low"          = farc_palette[["Low"]],
+                                 "High"         = farc_palette[["High"]])) +
+  scale_y_discrete(expand = expansion(add = c(0.5, 0.9))) +
+  scale_x_continuous( limits = c(-4, 2), 
+  breaks = seq(-4, 2, by = 1)) +
+  labs(x = "Effect on immediate higher-education access (pp)", y = NULL, colour = NULL,
+       caption = paste(
+         "Note: Each row is the pooled ATT (percentage points of the immediate higher-education transition rate)",
+         "\nfrom re-estimating the three-category high-versus-unexposed design under a different specification or",
+         "\nrobustness check. Colour denotes the exposure category (any/binary or high). Estimates come from a",
+         "\nweighted common-timing two-way fixed-effects DiD with municipality and department-by-year fixed effects,",
+         "\nweighted by 2010-2014 average exam-takers, and standard errors clustered by municipality. Markers are",
+         "\npoint estimates, horizontal bars are 95% confidence intervals, and labels report the p-value; the dashed",
+         "\nvertical line marks a null effect of zero."))+
+  theme_capstone()
+
+```
+
+# Mechanisms {#sec-mechanisms}
+
+The high-exposure result shows a relative decline in immediate higher-education access precisely where reductions in violence would predict the largest gains. This section explores the mechanisms behind this finding. I first show that the negative effect is driven by a composition effect: the access rate declined, but the number of students entering higher education did not, particularly in the smallest and most heavily exposed municipalities. I then rule out a set of alternative explanations, a coca opportunity-cost channel, differences in municipal fiscal capacity and spending, and a security-vacuum channel, none of which explains the observed pattern. Taken together, the evidence points to a supply-side absorption constraint concentrated in the smallest, most heavily exposed municipalities, and felt most acutely by women, rather than to any of these alternatives.
+
+```{r mech-setup}
+#| include: false
+zscore <- function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+
+# pre-ceasefire population, log + z-scored: the size moderator
+pop_z_df <- df |> filter(year <= 2014) |> group_by(cod_mpio) |>
+  summarise(pop_pre = mean(poblacion, na.rm = TRUE), .groups = "drop") |>
+  mutate(pop_z = zscore(log(pop_pre))) |> select(cod_mpio, pop_z)
+
+# composition outcomes: denominator (takers), absolute numerator (HE-entrants)
+dfm <- df |> left_join(pop_z_df, by = "cod_mpio") |>
+  mutate(log_takers = log1p(numstudents),
+         n_he       = numstudents * pro_he,
+         log1p_nhe  = log1p(n_he))
+dfm_hu <- dfm |> filter(intensity %in% c("unexposed", "high")) |>
+  mutate(did_h = cease * as.integer(intensity == "high"))
+
+# robust coefficient extractor (handles interaction-term name ordering)
+cf <- function(model, term, mult = 1) {
+  ct <- as.data.frame(coeftable(model)); nm <- rownames(ct)
+  t  <- if (grepl(":", term)) {
+    parts <- strsplit(term, ":")[[1]]
+    nm[vapply(nm, function(x) all(vapply(parts, grepl, logical(1), x, fixed = TRUE)), logical(1))][1]
+  } else term
+  c(est = unname(mult * ct[t, "Estimate"]), p = unname(ct[t, "Pr(>|t|)"]))
+}
+
+# joint pre-trends Wald on a three-category event study (optionally one arm)
+pre_pat_m <- paste(min(df$year):(ref_year - 1), collapse = "|")
+wald_arm  <- function(model, arm = NULL) {
+  pat <- paste0("year::(", pre_pat_m, "):intensity", if (is.null(arm)) "" else paste0("::", arm))
+  as.numeric(fixest::wald(model, pat)["p"])
+}
+fitm_es <- function(yvar, data = dfm, w = NULL) feols(
+  as.formula(sprintf("%s ~ i(year, intensity, ref = %d, ref2 = 'unexposed') | %s", yvar, ref_year, fe)),
+  data = data, weights = w, cluster = ~cod_mpio)
+```
+
+## The rate fell, but access did not {#sec-mechanism-composition}
+
+Higher education access is measured as the share of exam takers who enrol in higher education. Because both the numerator and denominator can change independently, the decline in the access rate does not necessarily imply fewer students reaching higher education. Decomposing the high-exposure effect into the two components shows that the negative rate does not reflect fewer students reaching higher education.
+
+```{r mech-composition}
+#| include: false
+# absolute HE-entrants (numerator), three-category static and its pre-trends
+m_abs    <- feols(as.formula(sprintf("log1p_nhe ~ did_low + did_high_u | %s", fe)),
+                  data = dfm, cluster = ~cod_mpio)
+abs_hi   <- cf(m_abs, "did_high_u")
+m_abs_es <- fitm_es("log1p_nhe")
+abs_pre  <- wald_arm(m_abs_es, "high")
+
+# denominator (takers): grew, but pre-trends fail (high arm) -> caveat
+m_tak    <- feols(as.formula(sprintf("log_takers ~ did_low + did_high_u | %s", fe)),
+                  data = dfm, cluster = ~cod_mpio)
+tak_hi   <- cf(m_tak, "did_high_u", 100)          # ~% change
+m_tak_es <- fitm_es("log_takers")
+tak_pre  <- wald_arm(m_tak_es, "high")
+```
+
+In the most heavily exposed municipalities the absolute number of immediate higher-education entrants did not fall after the ceasefire, by contrast it rose, the ATT is positive and statistically significant at 10% (@tbl-mech-composition), and this outcome shows no differential pre-trend^[There is insufficient statistical evidence to reject the null hypothesis of parallel trends. The joint Wald pre-trend test for the high-exposure category yields a p-value of `r sprintf("%.3f", abs_pre)`. See also @fig-mech-absaccess for study-event results.]. What fell was the rate, because its denominator, the number of exam-takers, grew faster than its numerator (@tbl-mech-composition). The negative result for the access rate does not indicate a decline in immediate access to higher education. Rather, it reflects a compositional effect driven by growth in the underlying population of exam takers.
+
+```{r tbl-mech-composition}
+#| tbl-cap: "High-exposure ATT on the immediate higher eduaction transition rate and its components (high vs. unexposed)"
+comp_tab <- bind_rows(
+  grab(m_arms, "did_high_u", "Transition rate (pp)"),
+  grab(m_abs,  "did_high_u", "Absolute HE entrants (%)"),
+  grab(m_tak,  "did_high_u", "Exam-takers (%)")
+) |>
+  rename(ATT = `ATT (pp)`, SE = `SE (pp)`) |>
+  mutate(
+    `Treated mun.` = c(
+      n_high,
+      dfm |> filter(intensity == "high", !is.na(log1p_nhe)) |> distinct(cod_mpio) |> nrow(),
+      dfm |> filter(intensity == "high", !is.na(log_takers)) |> distinct(cod_mpio) |> nrow()),
+    `Obs` = c(nobs(m_arms), nobs(m_abs), nobs(m_tak)),
+    `R-squared` = c(fixest::r2(m_arms, "r2"), fixest::r2(m_abs, "r2"), fixest::r2(m_tak, "r2"))
+  )
+
+comp_tab |>
+  mutate(`p-value` = ifelse(`p-value` < 0.001, "<0.001", sprintf("%.3f", `p-value`)),
+         across(c(ATT, SE), ~sprintf("%.2f", .x)),
+         `Obs` = format(`Obs`, big.mark = ","),
+         `R-squared` = sprintf("%.3f", `R-squared`)) |>
+  kbl(booktabs = TRUE, align = c("l", rep("c", 6))) |>
+  kable_styling(latex_options = "hold_position") |>
+  footnote(general = paste(
+    "Note: Each row reports the high-versus-unexposed ATT for one component of the immediate higher-education transition rate, from the three-category static two-way fixed-effects DiD with municipality and department-by-year fixed effects and standard errors clustered by municipality.",
+    "The transition rate is in percentage points and is weighted by each municipality's 2010-2014 average number of exam-takers; the numerator (absolute immediate higher-education entrants) and denominator (exam-takers) are counts in log(1 + var), so their ATT reads approximately as a percentage change, and are unweighted.",
+    "'Treated mun.' counts the high-exposure municipalities identifying the ATT, 'Obs' the municipality-year observations, and 'R-squared' the model fit.",
+    "The positive numerator shows that absolute access did not fall: the negative rate reflects a faster-growing denominator, not fewer students reaching higher education."),
+    general_title = "", threeparttable = TRUE)
+```
+
+I refrain from attributing this expansion in the pool of exam-takers to the ceasefire. Although the number of exam-takers increased in highly exposed municipalities (approximately `r sprintf("%.0f", tak_hi["est"])`% relative to unexposed), which would be consistent with the rise in secondary retention documented for this agreement at lower schooling levels [@PremVargasNamen2023; @MontanoBardalesPalacios2025]. However, the exam-taker series fails the pre-trends test^[There is enough statistical evidence to reject the null hypothesis of parallel trends. The jointWald pre-trend test for the high-exposure category yields a p-value of `r sprintf("%.3f", tak_pre)`. See also @fig-mech-takers  for study-event results.]  , indicating that highly exposed municipalities were already following differential enrolment trajectories prior to the ceasefire. This pre-existing divergence undermines a causal interpretation of the post-ceasefire expansion, preventing its clean attribution to the ceasefire. Accordingly, I interpret the growth in the denominator as a measurement issue affecting the access rate rather than as evidence of a causal retention mechanism. The substantive conclusion therefore rests on the numerator, for which identification is more credible.
+
+Regarding the gender gap highlighted in @sec-het-sex, an important question is whether the larger estimated penalty for women reflects a genuine reduction in women's access to higher education or also, a compositional effect arising from the denominator of the transition rate. Section @sec-appendix-sex addresses this issue and suggests two important findings.
+
+First, the decomposition of the transition rate into its numerator and denominator also indicates that the larger female penalty is driven predominantly by composition rather than a reduction in educational access. In absolute terms, female access to higher education did not decline. It increased by roughly the same amount as male access. However, the number of female exam takers grew more rapidly, causing the female transition rate to rise less, or even fall, despite stable or improving enrolment counts. The estimated gender gap therefore reflects, to a large extent, a denominator effect rather than a deterioration in women's educational opportunities. The analysis also uncovers a more substantive pattern. In the smallest municipalities, the female disadvantage persists even when access is measured in absolute terms. This is precisely the setting in which @sec-mechanism-size identifies binding supply-side constraints.
+
+However, the sex-specific level effects should be interpreted with caution. HonestDiD sensitivity analyses show that the estimates for women and men separately become fragile under even modest deviations from the parallel-trends assumption, much like the pooled effect (@sec-honestdid). The more defensible result is therefore not the magnitude of each sex-specific effect in isolation, but the gap between them. Because this gap compares women and men within the same municipality and year, many of the municipality-level trend violations that threaten the headline estimates are differenced out, making the heterogeneity result more credible than either level effect on its own.
+
+
+## The shortfall concentrates in the smallest municipalities {#sec-mechanism-size}
+
+If absolute access did not decline on average, an important question is whether the reduction in access rates documented in @sec-het-intensity was broadly shared across exposed municipalities or concentrated in particular contexts. To assess this, I examine heterogeneity by municipality size following the specification in @eq-ddd. The results indicate that the negative effect is concentrated among the smallest exposed municipalities.
+
+```{r mech-size}
+#| include: false
+# rate penalty is size-dependent (continuous population moderation)
+m_rate_pop <- feols(as.formula(sprintf(
+  "pro_he ~ did_h + did_h:pop_z + pop_z:cease | %s", fe)),
+  data = dfm_hu, weights = ~w_takers, cluster = ~cod_mpio)
+rate_mean  <- cf(m_rate_pop, "did_h", 100)          # effect at mean-pop municipality (pp)
+rate_sd    <- cf(m_rate_pop, "did_h:pop_z", 100)     # change per +1 SD log-pop (pp)
+
+# denominator grows evenly by size; numerator grows MORE in large munis
+m_tak_pop  <- feols(as.formula(sprintf(
+  "log_takers ~ did_h + did_h:pop_z + pop_z:cease | %s", fe)),
+  data = dfm_hu, cluster = ~cod_mpio)
+tak_sd     <- cf(m_tak_pop, "did_h:pop_z", 100)     # % change per +1 SD log-pop (matches @tbl-mech-size)
+m_nhe_pop  <- feols(as.formula(sprintf(
+  "log1p_nhe ~ did_h + did_h:pop_z + pop_z:cease | %s", fe)),
+  data = dfm_hu, cluster = ~cod_mpio)
+nhe_sd     <- cf(m_nhe_pop, "did_h:pop_z", 100)     # % change per +1 SD log-pop (matches @tbl-mech-size)
+```
+ 
+@tbl-mech-size presents the results. Its first two rows describe the rate itself, in a municipality of average size the high-exposure effect on the rate is `r sprintf("%.2f", rate_mean["est"])` percentage points, and each additional standard deviation of population makes it `r sprintf("%.2f", rate_sd["est"])` percentage points less negative. The penalty is therefore deepest in the smallest municipalities and fades in the largest.
+
+The final two rows help identify the source of this heterogeneity by estimating analogous population-size interactions for the numerator and denominator of the access rate. The number of exam-takers expands at essentially the same pace regardless of size, its size effect is `r sprintf("%.2f", tak_sd["est"])`% per standard deviation and is not statistically significant. The absolute number of students reaching higher education, by contrast, is what carries the size effect. It grows `r sprintf("%.2f", nhe_sd["est"])`% more per standard deviation of population^[Joint Wald pre-trend test for the high-exposure category, p-value = `r sprintf("%.3f", abs_pre)`]. Hence, after the ceasefire the pool of exam-takers grows by a similar proportion everywhere, but the number actually reaching higher education grows faster in large municipalities than in small ones, so the transition rate falls most where municipalities are smallest.
+
+```{r tbl-mech-size}
+#| tbl-cap: "Population-size moderation of the high-exposure effect on the immediate higher-education transition rate and its components (high vs. unexposed)"
+n_high_rate <- dfm_hu |> filter(intensity == "high", !is.na(pro_he), !is.na(w_takers)) |> distinct(cod_mpio) |> nrow()
+n_high_nhe  <- dfm_hu |> filter(intensity == "high", !is.na(log1p_nhe)) |> distinct(cod_mpio) |> nrow()
+n_high_tak  <- dfm_hu |> filter(intensity == "high", !is.na(log_takers)) |> distinct(cod_mpio) |> nrow()
+
+size_tab <- bind_rows(
+  grab(m_rate_pop, "did_h",       "Rate: level at mean size (pp)"),
+  grab(m_rate_pop, "did_h:pop_z", "Rate: change per +1 SD of size (pp)"),
+  grab(m_nhe_pop,  "did_h:pop_z", "HE entrants: change per +1 SD of size (%)"),
+  grab(m_tak_pop,  "did_h:pop_z", "Exam-takers: change per +1 SD of size (%)")
+) |>
+  rename(Estimate = `ATT (pp)`, SE = `SE (pp)`) |>
+  mutate(
+    `Treated mun.` = c(n_high_rate, n_high_rate, n_high_nhe, n_high_tak),
+    `Obs`          = c(nobs(m_rate_pop), nobs(m_rate_pop), nobs(m_nhe_pop), nobs(m_tak_pop)),
+    `R-squared`    = c(fixest::r2(m_rate_pop, "r2"), fixest::r2(m_rate_pop, "r2"),
+                       fixest::r2(m_nhe_pop, "r2"), fixest::r2(m_tak_pop, "r2"))
+  )
+
+size_tab |>
+  mutate(`p-value` = ifelse(`p-value` < 0.001, "<0.001", sprintf("%.3f", `p-value`)),
+         across(c(Estimate, SE), ~sprintf("%.2f", .x)),
+         `Obs` = format(`Obs`, big.mark = ","),
+         `R-squared` = sprintf("%.3f", `R-squared`)) |>
+  kbl(booktabs = TRUE, align = c("l", rep("c", 6))) |>
+  kable_styling(latex_options = "hold_position", full_width = FALSE) |>
+  column_spec(1, width = "4cm") |>
+  footnote(general = paste(
+    "Note: Each estimate comes from a triple-difference specification on the high-versus-unexposed sample that lets pre-ceasefire municipality population (log, z-standardised) moderate the high-exposure effect, with municipality and department-by-year fixed effects and standard errors clustered by municipality. The size slope is the change per one standard deviation of log population.",
+    "The transition rate is in percentage points and weighted by each municipality's 2010-2014 average number of exam-takers. The numerator (absolute immediate higher-education entrants) and denominator (exam-takers) are counts in log(1 + var), so their estimates read approximately as percentage changes, and are unweighted.",
+    "Treated mun. counts the high-exposure municipalities identifying each estimate, 'Obs' the municipality-year observations, and 'R-squared' the model fit."),
+    general_title = "", threeparttable = TRUE)
+```
+
+## Coca cultivation {#sec-mechanism-coca}
+
+An alternative explanation is that the coca economy raises the opportunity cost of schooling. If the returns to illicit labour are higher in coca-growing areas, transitions to higher education may fall independently of the ceasefire [@Angulo2024; @RodriguezSanchez2012]. However, the results do not support this interpretation. The high-exposure effect does not vary with pre-ceasefire coca cultivation, and the relative reduction in access is statistically indistinguishable between coca-growing and non-coca-growing municipalities.
+
+```{r mech-coca}
+#| include: false
+coca_base <- dfm |> filter(year <= 2014) |> group_by(cod_mpio) |>
+  summarise(coca_pre = mean(coca_crops, na.rm = TRUE), .groups = "drop") |>
+  mutate(high_coca = as.integer(coca_pre > 0))       # presence: coca is mostly zero
+dfm_hu_c  <- dfm_hu |> left_join(coca_base, by = "cod_mpio")
+m_coca    <- feols(as.formula(sprintf(
+  "pro_he ~ did_h + did_h:high_coca + high_coca:cease | %s", fe)),
+  data = dfm_hu_c, weights = ~w_takers, cluster = ~cod_mpio)
+coca_mod  <- cf(m_coca, "did_h:high_coca", 100)
+```
+
+The interaction between the high-exposure effect and baseline coca cultivation is `r sprintf("%.2f", coca_mod["est"])` percentage points, statistically indistinguishable from zero (@tbl-mech-alt). This implies that the effect does not vary systematically with pre-ceasefire coca intensity and the decline in access is no greater in municipalities with higher levels of coca cultivation.
+
+## Fiscal capacity and public spending {#sec-mechanism-moderators}
+
+A related concern is that the estimated effect for highly exposed municipalities may reflect differences in local state capacity rather than exposure to FARC violence itself. To assess this possibility, I examine three measures of municipal fiscal capacity constructed from pre-ceasefire (2010-2014) per capita averages: fiscal revenue, total expenditure, and national government transfers. Each measure is dichotomised at its median and incorporated into a triple-difference specification by interacting it with the high-exposure treatment effect, following Equation @eq-ddd. A statistically significant interaction would indicate that the estimated effect varies with the municipality's fiscal capacity. As shown in @tbl-mech-moderators, none of the interaction terms is statistically significant. The negative effect observed in highly exposed municipalities therefore cannot be attributed to differences in municipal fiscal capacity or public spending, and appears to be broadly homogeneous across these dimensions.
+
+```{r tbl-mech-moderators}
+#| tbl-cap: "Public-finance moderators of the high-exposure effect (static triple interaction, high vs. unexposed)"
+finmod <- df |> filter(year <= 2014) |> group_by(cod_mpio) |>
+  summarise(pop = mean(poblacion, na.rm = TRUE), tax = mean(total_income_real, na.rm = TRUE),
+            spend = mean(total_expenses_real, na.rm = TRUE),
+            transf = mean(total_transfers_real, na.rm = TRUE), .groups = "drop") |>
+  mutate(tax_pc = tax / pop, spend_pc = spend / pop, transf_pc = transf / pop,
+         high_tax       = as.integer(tax_pc    > median(tax_pc,    na.rm = TRUE)),
+         high_spend     = as.integer(spend_pc  > median(spend_pc,  na.rm = TRUE)),
+         high_transfers = as.integer(transf_pc > median(transf_pc, na.rm = TRUE)))
+dfa <- dfm_hu |> left_join(
+  finmod |> select(cod_mpio, high_tax, high_spend, high_transfers), by = "cod_mpio")
+
+modrow <- function(v, label) {
+  m  <- feols(as.formula(sprintf("pro_he ~ did_h + did_h:%s + %s:cease | %s", v, v, fe)),
+              data = dfa, weights = ~w_takers, cluster = ~cod_mpio)
+  ct <- as.data.frame(coeftable(m)); term <- paste0("did_h:", v)
+  n_high <- dfa |> filter(intensity == "high", !is.na(pro_he), !is.na(w_takers), !is.na(.data[[v]])) |>
+    distinct(cod_mpio) |> nrow()
+  tibble(Moderator      = label,
+         Estimate       = 100 * ct[term, "Estimate"],
+         SE             = 100 * ct[term, "Std. Error"],
+         `p-value`      = ct[term, "Pr(>|t|)"],
+         `Treated mun.` = n_high,
+         `Obs`          = nobs(m),
+         `R-squared`    = fixest::r2(m, "r2"))
+}
+
+bind_rows(
+  modrow("high_tax",       "Fiscal revenue"),
+  modrow("high_spend",     "Total expenditure"),
+  modrow("high_transfers", "National transfers")
+) |>
+  mutate(`p-value` = ifelse(`p-value` < 0.001, "<0.001", sprintf("%.3f", `p-value`)),
+         across(c(Estimate, SE), ~sprintf("%.2f", .x)),
+         `Obs` = format(`Obs`, big.mark = ","),
+         `R-squared` = sprintf("%.3f", `R-squared`)) |>
+  kbl(booktabs = TRUE, align = c("l", rep("c", 6))) |>
+  kable_styling(latex_options = "hold_position", full_width = FALSE) |>
+  column_spec(1, width = "4cm") |>
+  footnote(general = paste(
+    "Note: Each row is a static triple-difference interaction between the high-exposure effect and one municipal public-finance moderator, estimated on the high-versus-unexposed sample with municipality and department-by-year fixed effects, weighted by each municipality's 2010-2014 average number of exam-takers, and standard errors clustered by municipality.",
+    "Each moderator is a pre-ceasefire (2010-2014) per-capita average split at its median into a high indicator. The estimate is the interaction effect on the higher-education access rate in percentage points, and an estimate indistinguishable from zero means the high-exposure penalty does not vary with that characteristic.",
+    "Treated mun. counts the high-exposure municipalities identifying each estimate, 'Obs' the municipality-year observations, and 'R-squared' the model fit."),
+    general_title = "", threeparttable = TRUE)
+```
+
+## A non-FARC security vacuum {#sec-mechanism-vacuum}
+
+An important alternative explanation is that the ceasefire generated a security vacuum. To the extent that the FARC's withdrawal facilitated the expansion of other armed actors into its vacated territory [@Richani1997], any resulting increase in successor violence could depress educational transitions in highly exposed municipalities independently of the ceasefire's direct effects [@PenaDorussen2021]. I test this mechanism by examining post-ceasefire changes in non-FARC violence across all eleven SIEVCAC categories, rather than restricting attention to incidents involving the FARC.
+
+```{r mech-vacuum}
+#| include: false
+vcats  <- c("WA","DP","AS","AT","DB","DF","MI","MA","RU","SE","VS")
+vcols  <- paste0("n_eventos_", vcats, "_0")
+vcols  <- vcols[vcols %in% names(dfm_hu)]
+dfm_hu <- dfm_hu |> mutate(nofarc_all = rowSums(across(all_of(vcols)), na.rm = TRUE),
+                           treat_hi   = as.integer(intensity == "high"))
+m_vac    <- feols(as.formula(sprintf("nofarc_all ~ did_h | %s", fe)),
+                  data = dfm_hu, cluster = ~cod_mpio)
+vac_hi   <- cf(m_vac, "did_h")
+# event study interacts year with the time-invariant treatment indicator
+# (NOT did_h, which is zero in every pre-period year)
+m_vac_es <- feols(as.formula(sprintf("nofarc_all ~ i(year, treat_hi, ref = %d) | %s", ref_year, fe)),
+                  data = dfm_hu, cluster = ~cod_mpio)
+vac_pre  <- as.numeric(fixest::wald(m_vac_es, paste0("year::(", pre_pat_m, "):treat_hi"))["p"])
+```
+
+According to the results in @tbl-mech-alt, there is no evidence of a surge in successor violence following the ceasefire. If anything, non-FARC violence declined more in highly exposed municipalities (`r sprintf("%.2f", vac_hi["est"])` events per municipality-year), the opposite of what a security-vacuum mechanism would predict. However, this specification fails the pre-trends test^[Joint Wald test for the high-exposure category, p-value = `r sprintf("%.3f", vac_pre)`] indicating that the two groups were already following different violence trajectories before the ceasefire. I therefore interpret these findings as providing no positive evidence of a violent vacuum, rather than as a definitive causal rejection of the hypothesis. 
+
+```{r tbl-mech-alt}
+#| tbl-cap: "Alternative-channel tests: coca cultivation and a non-FARC security vacuum (high vs. unexposed)"
+mrow <- function(m, term, label, mult = 1) {
+  ct <- as.data.frame(coeftable(m))
+  tibble(Specification = label,
+         Estimate = mult * ct[term, "Estimate"],
+         SE       = mult * ct[term, "Std. Error"],
+         `p-value`= ct[term, "Pr(>|t|)"])
+}
+
+n_high_coca <- dfm_hu_c |> filter(intensity == "high", !is.na(pro_he), !is.na(w_takers)) |> distinct(cod_mpio) |> nrow()
+n_high_vac  <- dfm_hu   |> filter(intensity == "high", !is.na(nofarc_all)) |> distinct(cod_mpio) |> nrow()
+
+alt_tab <- bind_rows(
+  mrow(m_coca, "did_h:high_coca", "Coca cultivation interaction (pp)",        100),
+  mrow(m_vac,  "did_h",           "Non-FARC violence DiD",     1)
+) |>
+  mutate(
+    `Treated mun.` = c(n_high_coca, n_high_vac),
+    `Obs`          = c(nobs(m_coca), nobs(m_vac)),
+    `R-squared`    = c(fixest::r2(m_coca, "r2"), fixest::r2(m_vac, "r2"))
+  )
+
+alt_tab |>
+  mutate(`p-value` = ifelse(`p-value` < 0.001, "<0.001", sprintf("%.3f", `p-value`)),
+         across(c(Estimate, SE), ~sprintf("%.2f", .x)),
+         `Obs` = format(`Obs`, big.mark = ","),
+         `R-squared` = sprintf("%.3f", `R-squared`)) |>
+  kbl(booktabs = TRUE, align = c("l", rep("c", 6))) |>
+  kable_styling(latex_options = "hold_position", full_width = FALSE) |>
+  column_spec(1, width = "4cm") |>
+  footnote(general = paste(
+    "Note: Tests of two alternative channels for the high-exposure penalty, both on the high-versus-unexposed sample with municipality and department-by-year fixed effects and standard errors clustered by municipality.",
+    "Row 1 is the triple-difference interaction between the high-exposure effect and pre-ceasefire coca presence on the immediate higher-education transition rate (percentage points, weighted by each municipality's 2010-2014 average number of exam-takers); an estimate indistinguishable from zero means coca cultivation does not moderate the effect.",
+    "Row 2 is the post-ceasefire high-versus-unexposed difference-in-differences on the count of non-FARC-attributed violent events per municipality-year (all eleven SIEVCAC categories, unweighted); a positive value would indicate a successor-violence vacuum, whereas the estimate is negative.",
+    "Treated mun. counts the high-exposure municipalities identifying each estimate, 'Obs' the municipality-year observations, and 'R-squared' the model fit."),
+    general_title = "", threeparttable = TRUE)
+```
+
+# Limitations {#sec-limitations}
+
+Several considerations are particularly relevant for interpreting the results. First, the measure of higher-education access captures only immediate transitions into higher education and therefore does not account for delayed enrolment. The estimates should consequently be interpreted as reflecting short-run access patterns. Second, because access is measured as a rate, changes in the outcome may arise from variation in either the numerator or the denominator. As shown in @sec-mechanism-composition, the negative high-exposure estimate is driven primarily by an expansion in the number of exam-takers rather than by a reduction in the number of students entering higher education. The results should therefore be interpreted with this compositional feature in mind.
+
+Second, the armed-conflict data do not constitute a complete census of violent events. Underreporting may be more severe in municipalities with limited state presence, weak media coverage, or intense guerrilla activity, potentially introducing measurement error correlated with conflict exposure. Although the absence of an independent event-count dataset prevents a direct assessment of this bias, the fixed-effects design absorbs any time-invariant differences in reporting across municipalities. To the extent that underreporting is concentrated in areas of active conflict, it would more likely attenuate estimated effects than generate spurious ones. Nevertheless, this remains an important limitation and merits further investigation using alternative conflict and victimisation datasets.
+
+Third, the peace process and the ceasefire were an agreement between the national government and the FARC guerrilla. Although this substantially reduced FARC-attributed violence, Colombia continues to experience violence from the ELN and from criminal organisations operating outside the formal armed conflict. The exposure measure used here captures only FARC-attributed violence reduction, so observed changes in immediate higher-education access could in principle be confounded by the continuation or intensification of violence from these other actors in the same municipalities. @sec-comparison-group addresses part of this concern directly, by showing the negative high-exposure result survives when the control group is restricted to municipalities that experienced non-FARC violence over the same period. However, it cannot rule out a subtler version of the concern, that ELN or criminal-group activity in FARC-exposed municipalities specifically changed after the ceasefire in ways correlated with, but not caused by, FARC's withdrawal, which @sec-mechanism-vacuum investigates as directly as the available violence registry allows.
+
+Fourth, the identifying design relies on SUTVA, which requires that the potential outcomes of a municipality do not depend on the treatment status of neighbouring municipalities. This assumption may be difficult to sustain in the present context. FARC influence was geographically concentrated, and many low-exposure or ostensibly untreated municipalities bordered highly exposed areas. As a result, the ceasefire's effects may have spilled across municipal boundaries through several channels, including increased access to regional higher-education centres, broader economic and demographic recovery, and the reorganisation of armed actors across adjacent territories. To the extent that such spillovers occurred, they would most likely have benefited municipalities in the comparison group, attenuating the estimated treatment effect. Under this interpretation, the estimates reported in @sec-empirical-strategy and @sec-results should be viewed as conservative. Distinguishing direct effects from spillover effects is beyond the scope of the present dissertation and remains an important avenue for future research.
+
+Finally, as in any difference-in-differences design, the results are only as credible as the parallel-trends assumption. @sec-event-study through @sec-honestdid report pre-trends tests and HonestDiD sensitivity analyses because a passed pre-test provides evidence for, but cannot validate, that assumption. The high-exposure level estimates, including the sex-specific results, appear sensitive to these assumptions (@sec-honestdid; @sec-appendix-sex). 
+
+# Conclusion {#sec-conclusion}
+
+This dissertation provides, to my knowledge, the first evidence on whether Colombia's post-conflict violence reduction extended beyond primary and secondary schooling to affect immediate access to higher education. The headline result, pooling any FARC exposure into a single binary treatment, is a null effect (@sec-static-did). But that null does not survive disaggregation by exposure intensity. @sec-het-intensity shows that in the municipalities that were most heavily exposed to FARC violence before the ceasefire, the immediate higher-education transition rate fell, relative to unexposed municipalities. This negative estimate is statistically significant and survives the robustness checks in @sec-robustness, but a HonestDiD sensitivity analysis shows it does not withstand more than a modest violation of parallel trends (@sec-honestdid). It is therefore suggestive rather than robust.
+
+This pattern runs counter to the peace dividend mechanism motivating the dissertation. If improved security were driving the results (@sec-intro), higher exposure should be associated with greater gains in access, not relative losses. Section @sec-mechanisms tests several alternative explanations. The effect is not driven by a generic conflict-area effect, as it remains when the comparison group is restricted to non-FARC conflict municipalities (@sec-comparison-group). Nor is it explained by the coca economy (@sec-mechanism-coca). Finally, there is no evidence consistent with a violent security vacuum (@sec-mechanism-vacuum), although this test rests on weaker pre-trends evidence and cannot capture non-violent changes in local order.
+
+What the mechanism analysis establishes is that the negative rate effect does not represent a decline in absolute access. As shown in @sec-mechanism-composition, the number of students entering higher education did not fall in heavily exposed municipalities. The rate declined because the pool of exam-takers expanded more rapidly than the number transitioning. A genuine reduction in absolute access appears only in the smallest and most heavily exposed municipalities (@sec-mechanism-size), and disproportionately among young women (@sec-het-sex). 
+
+The most plausible reading of this localised shortfall is a supply-side constraint on access rather than a fall in demand. Higher-education provision in Colombia is concentrated in the larger cities and departmental capitals, and closing that rural access gap is itself an explicit aim of the peace agreement's rural-education agenda [@MEN2018a]. In the smallest and most remote municipalities, then, the post-ceasefire rise in secondary graduates outpaced the local capacity to absorb them: more students finished school and sat the exam, but the institutions, programmes, and places needed to enrol them did not expand at the same rate or within reach. This capacity gap is compounded by demand-side barriers that bind hardest in exactly these places, the direct and opportunity costs of enrolling [@LondonoVelezRodriguezSanchez2020], and the expense and disruption of moving to a distant city to study and it falls hardest on young women. The shortfall is therefore best understood as a deficit in the local supply and reach of higher-education opportunities, not as a decline in young people's aspiration to pursue them.
+
+The results imply that policies designed to improve higher-education access may benefit from a more differentiated territorial strategy. Rather than relying exclusively on nationwide programmes, policymakers could prioritise municipalities with the greatest exposure to the conflict, where access constraints appear most persistent. Such a strategy is consistent with the mechanism analysis, which suggests that the main challenge lies not in educational demand but in the capacity of the higher-education system to absorb new graduates. If the spillover channels discussed in @sec-limitations are also present, the gains from targeted interventions may extend beyond the municipalities directly affected, further strengthening the case for place-based policy responses.
+
+Equally important, these results suggest that reductions in violence do not automatically translate into greater educational opportunities. Nearly a decade after the signing of the the Peace Agreement, its implementation has remained uneven and incomplete, largely reflecting the political priorities and differing visions of successive governments [@Llorente2026]. While notable progress has been achieved in restorative justice and truth-telling processes, far less has been accomplished in tackling the structural territorial inequalities that the Agreement sought to address. Limited advances in education, healthcare, poverty alleviation, and rural development have constrained improvements in life opportunities across many former conflict-affected areas. In this context, the findings support the view that the institutional and socioeconomic conditions required to expand access to higher education remain insufficient, particularly in the municipalities most affected by the conflict.
+\newpage
+
+# References {-}
+
+::: {#refs}
+:::
+
+```{=latex}
+\newpage
+\appendix
+% Appendix figures/tables get their own numbering: A.1, A.2, ...
+\setcounter{table}{0}
+\setcounter{figure}{0}
+\renewcommand{\thetable}{A.\arabic{table}}
+\renewcommand{\thefigure}{A.\arabic{figure}}
+```
+# Appendix {#sec-appendix .unnumbered}
+
+# Distribution of conflict events {#sec-appendix-events}
+
+@tbl-events reports, for each of the eleven violence categories recorded by SIEVCAC during the pre-ceasefire period (2010-2014), the total number of events and their attribution across armed actors. For each category, the table shows the share attributed to the FARC, the share with no identified perpetrator, and the share attributed to other actors. The latter combines all non-FARC incidents, including both events attributed to other armed groups and those with unidentified perpetrators. The categories most strongly associated with FARC activity, namely war actions, selective killings, terrorist attacks, kidnappings, antipersonnel mines, and property damage, form the exposure measure used in @sec-treatment.
+
+```{r tbl-events}
+#| tbl-cap: "Distribution of armed-conflict events by type and attribution, 2010–2014"
+vp <- readRDS(file.path(data_violence, "violence_panel2010_2024.rds")) |>
+  filter(year >= 2010, year <= 2014)
+ev_cats <- c(WA = "War actions",        DP = "Damage to settlements",
+             AS = "Selective murders",  AT = "Terrorist attacks",
+             DB = "Damage to property", DF = "Forced disappearance",
+             MI = "Antipersonnel mines",MA = "Massacres",
+             RU = "Recruitment",        SE = "Kidnappings",
+             VS = "Sexual violence")
+ev_raw <- purrr::map_dfr(names(ev_cats), function(s) tibble(
+  type   = unname(ev_cats[[s]]),
+  farc   = sum(vp[[paste0("n_eventos_", s, "_1")]], na.rm = TRUE),
+  nofarc = sum(vp[[paste0("n_eventos_", s, "_0")]], na.rm = TRUE),
+  unid   = sum(vp[[paste0("n_events_unid_", s)]], na.rm = TRUE))) |>
+  arrange(desc(farc + nofarc))
+ev_raw <- bind_rows(ev_raw, tibble(type = "Total", farc = sum(ev_raw$farc),
+                                   nofarc = sum(ev_raw$nofarc), unid = sum(ev_raw$unid)))
+pf <- function(x, t) ifelse(t > 0, sprintf("%.1f", 100 * x / t), "—")
+ev_tab <- ev_raw |>
+  mutate(total = farc + nofarc, other = pmax(nofarc - unid, 0)) |>
+  transmute(`Event type`     = type,
+            `Total events`    = total,
+            `% FARC`          = pf(farc, total),
+            `% Unidentified`  = pf(unid, total),
+            `% Other actors`  = pf(other, total))
+kbl(ev_tab, booktabs = TRUE, align = c("l", "r", "c", "c", "c"),
+    format.args = list(big.mark = ",")) |>
+  kable_styling(latex_options = "hold_position") |>
+  row_spec(nrow(ev_tab), bold = TRUE) |>
+  footnote(general = paste(
+    "Note: Total number of armed-conflict events per SIEVCAC category over the pre-ceasefire window (2010-2014), with the share attributed to the FARC, to unidentified perpetrators, and to other (non-FARC) armed actors.",
+    "'Other actors' equals the non-FARC total net of unidentified events. The Total row aggregates all eleven categories."),
+    general_title = "", threeparttable = TRUE)
+```
+
+# Re-including the country's largest cities {#sec-appendix-cities}
+
+The main analysis excludes Colombia's 13 largest cities from the construction of the exposure measure, as their size and socioeconomic characteristics make them poor comparators for the small and medium-sized municipalities where the FARC was most active. Reintroducing them therefore primarily adds unexposed or low-exposure municipalities to the comparison group. If the estimated effect for highly exposed municipalities were driven by their exclusion, the results should change materially once these cities are included.
+
+```{r rob-cities}
+#| include: false
+base_all <- readRDS(file.path(data_final, "final_panel_2010_2023.rds"))
+
+main_cities <- c("11001","05001","76001","08001","13001","68001",
+                 "17001","52001","66001","54001","73001","23001","50001")
+                 
+df_city  <- base_all |> filter(!is.na(poblacion))            # keep the 13 cities
+exp_city <- build_exposure(df_city, 2010:2014) |> filter(is.finite(attacks_pc))
+med_pos_c <- median(exp_city$attacks_pc[exp_city$attacks_pc > 0])
+
+exp_city <- exp_city |>
+  mutate(treat_presence = as.integer(attacks_pc > 0),
+         intensity = factor(case_when(attacks_pc == 0 ~ "unexposed",
+                                      attacks_pc <= med_pos_c ~ "low",
+                                      TRUE ~ "high"),
+                            levels = c("unexposed","low","high")),
+         farc_logint = log1p(attacks_pc))
+
+panel_city <- df_city |>
+  inner_join(select(exp_city, cod_mpio, attacks_pc, treat_presence,
+                    intensity, farc_logint), by = "cod_mpio") |>
+  mutate(cease = as.integer(year >= 2014),
+         did_presence = cease * treat_presence,
+         did_low = cease * as.integer(intensity == "low"),
+         did_high_u = cease * as.integer(intensity == "high"))
+n_cities_added <- length(intersect(unique(panel_city$cod_mpio), main_cities))
+
+m_allmun_r <- feols(as.formula(sprintf("pro_he ~ did_low + did_high_u | %s", fe)),
+                data = panel_city, weights = ~w_takers, cluster = ~cod_mpio)
+
+chk_cities <- grab(m_allmun_r, "did_high_u", "Appendix: +13 largest cities")
+
+att_city <- chk_cities[["ATT (pp)"]]; p_city <- chk_cities[["p-value"]]
+```
+
+Including the `r n_cities_added` largest cities and rebuilding the exposure split on the enlarged sample leaves the high-exposure ATT at `r sprintf("%.2f", att_city)` percentage points with a p-value of `r ifelse(p_city < 0.001, "<0.001", sprintf("%.3f", p_city))`. The estimate is essentially unchanged, confirming that the result is a feature of the FARC-exposed municipalities themselves rather than of the decision to set the big cities aside.
+
+```{r rob-cities-es}
+#| include: false
+m_int_city <- feols(as.formula(sprintf(
+  "%s ~ i(year, intensity, ref = %d, ref2 = 'unexposed') | cod_mpio + %s^year",
+  outcome, ref_year, dept)),
+  data = panel_city, weights = ~w_takers, cluster = ~cod_mpio)
+df_int_city <- tidy_es(m_int_city, ref_year, group_var = "intensity")
+df_int_city$group <- factor(df_int_city$group, levels = c("low", "high"))
+ptp_cities <- wald_pre(m_int_city, "intensity")$p_value
+```
+
+The dynamic pattern is likewise largely unchanged. Re-estimating the three-category event study on the expanded sample that includes the largest cities (@fig-cities-eventstudy) reproduces the results reported in @sec-het-intensity. Following the ceasefire, the high-exposure group experiences a relative decline compared with the unexposed group, whereas the low-exposure group continues to track the latter closely. The pre-trends are somewhat weaker than in the baseline specification. Although the pre-treatment coefficients are jointly insignificant at the 5% level, they fail to do so at the 10% level (Wald p-value = `r sprintf("%.3f", ptp_cities)`), suggesting some caution in interpreting the dynamic estimates.
+
+```{r fig-cities-eventstudy}
+#| fig-cap: "Event study — three-category exposure intensity (low and high, each vs. unexposed), with the 13 largest cities re-included"
+plot_es(df_int_city, "Exposure intensity, 13 main cities re-included",
+        ref_year, grouped = TRUE) +
+  scale_x_continuous(breaks = seq(min(panel_city$year), max(panel_city$year), by = 2),
+                     labels = seq(min(panel_city$year), max(panel_city$year), by = 2)) +
+  labs(caption = paste(
+    "Note: Robustness re-estimate of the three-category event study with the 13 largest cities (excluded from the baseline) added back to the",
+    "\nsample. The outcome is the municipal higher-education access rate. Exposed municipalities are split at the median per-capita FARC",
+    "\nattack rate (2010-2014) into low- (green) and high-exposure (red) groups, each compared with the common unexposed group.",
+    "\nEstimates come from a weighted two-way fixed-effects event study with municipality and department-by-year fixed effects, weighted",
+    "\nby each municipality's 2010-2014 average number of exam-takers, with standard errors clustered by municipality. Points are",
+    "\ncoefficients relative to the 2013 reference cohort (dashed line) and bars are 95% confidence intervals."))
+```
+
+# Composition dynamics: entrants and exam-takers {#sec-appendix-composition}
+
+This section presents the dynamic counterpart to the static decomposition in @sec-mechanism-composition. It estimates event studies separately for the two components of the transition rate: the numerator, the number of students entering higher education, and the denominator, the number of exam-takers, by FARC-exposure intensity. The results show no decline in the absolute number of higher-education entrants in highly exposed municipalities (@fig-mech-absaccess). By contrast, the number of exam-takers increases (@fig-mech-takers), although the corresponding specification fails the pre-trends test and is therefore interpreted descriptively.
+
+```{r fig-mech-absaccess}
+#| fig-cap: "Event study — higher-education entrants by FARC-exposure intensity"
+df_abs <- tidy_es(m_abs_es, ref_year, group_var = "intensity")
+df_abs$group <- factor(df_abs$group, levels = c("low", "high"))
+plot_es(df_abs, "Absolute higher-education entrants by exposure intensity", ref_year,
+        grouped = TRUE, pct = FALSE, y_lab = sprintf("Effect on log(1 + HE entrants), rel. to %d", ref_year)) +
+  labs(caption = paste(
+    "Note: The outcome is the number of higher-education entrants per municipality, transformed as log(1 + entrants). This transformation",
+    "\nis used because a small numberof municipality-years have no entrants. The vertical axis is in log points. Exposed municipalities are",
+    "\nsplit at the median per-capita FARC attack rate (2010-2014), into low-(green) and high-exposure (red) groups, each compared with",
+    "\nthe common unexposed group. Estimates come from a two-way fixed-effects event study with municipality and department-by-year",
+    "\nfixed effects and standard errors clustered by municipality. Points are coefficients relative to the 2013 reference cohort and bars are",
+    "\n95% confidence intervals. The dashed vertical line marks the 2013 reference year."))
+```
+
+```{r fig-mech-takers}
+#| fig-cap: "Event study — exam-takers by FARC-exposure intensity"
+df_tak <- tidy_es(m_tak_es, ref_year, group_var = "intensity")
+df_tak$group <- factor(df_tak$group, levels = c("low", "high"))
+plot_es(df_tak, "Exam-takers by exposure intensity", ref_year,
+        grouped = TRUE, pct = FALSE, y_lab = sprintf("Effect on log(1 + exam-takers), rel. to %d", ref_year)) +
+  labs(caption = paste(
+    "Note: The outcome is the number of Saber 11 exam-takers per municipality, the denominator of the transition rate, transformed as",
+    "\nlog(1 + takers). The vertical axis is in log points. Exposed municipalities are split at the median per-capita FARC attack rate (2010-",
+    "\n2014) into low- (green) and high-exposure (red) groups, each compared with the common unexposed group. Estimates come",
+    "\nfrom a two-way fixed-effects event study with municipality and department-by-year fixed effects and standard errors clustered by",
+    "\nmunicipality.Points are coefficients relative to the 2013 reference cohort and bars are 95% confidence intervals. The dashed vertical",
+    "\nline marks the 2013 reference year."))
+```
+
+# Sex heterogeneity: decomposition and sensitivity {#sec-appendix-sex}
+
+@sec-het-sex reports that the high-exposure penalty on the higher-education transition rate is significantly larger for female than for male students. This appendix aims to answer two questions: is the larger female penalty a genuine fall in women's access, or as for the pooled result in @sec-mechanism-composition, an artefact of the rate's denominator; and how robust is it to violations of parallel trends (HonestDiD)?
+
+```{r appx-sex}
+#| include: false
+# sex-specific weights, outcomes, clean high-vs-unexposed sample, size moderator
+wS <- df |> filter(year %in% 2010:2014) |> group_by(cod_mpio) |>
+  summarise(w_F = mean(numstudents_F, na.rm = TRUE),
+            w_M = mean(numstudents_M, na.rm = TRUE), .groups = "drop")
+pz <- df |> filter(year <= 2014) |> group_by(cod_mpio) |>
+  summarise(pp = mean(poblacion, na.rm = TRUE), .groups = "drop") |>
+  mutate(pop_z = (log(pp) - mean(log(pp), na.rm = TRUE)) / sd(log(pp), na.rm = TRUE)) |>
+  select(cod_mpio, pop_z)
+dS <- df |> left_join(wS, by = "cod_mpio") |> left_join(pz, by = "cod_mpio") |>
+  mutate(log1p_nhe_F = log1p(numstudents_F * pro_he_F), ltak_F = log1p(numstudents_F),
+         log1p_nhe_M = log1p(numstudents_M * pro_he_M), ltak_M = log1p(numstudents_M))
+dShu <- dS |> filter(intensity %in% c("unexposed", "high")) |>
+  mutate(treat_h = as.integer(intensity == "high"), did_h = cease * treat_h)
+
+hi <- function(m, term = "did_high_u") {
+  ct <- as.data.frame(coeftable(m)); nm <- rownames(ct)
+  t <- if (grepl(":", term)) nm[grepl("did_h", nm) & grepl("pop_z", nm)][1] else term
+  c(est = unname(ct[t, "Estimate"]), p = unname(ct[t, "Pr(>|t|)"]))
+}
+fdec <- function(y, wt) feols(as.formula(sprintf("%s ~ did_low + did_high_u | %s", y, fe)),
+                              data = dS, weights = wt, cluster = ~cod_mpio)
+dFden <- hi(fdec("ltak_F", NULL)); dFabs <- hi(fdec("log1p_nhe_F", NULL)); dFrate <- hi(fdec("pro_he_F", ~w_F))
+dMden <- hi(fdec("ltak_M", NULL)); dMabs <- hi(fdec("log1p_nhe_M", NULL)); dMrate <- hi(fdec("pro_he_M", ~w_M))
+
+# female absolute access, moderated by municipality size
+mFpop <- feols(as.formula(sprintf("log1p_nhe_F ~ did_h + did_h:pop_z + pop_z:cease | %s", fe)),
+               data = dShu, cluster = ~cod_mpio)
+fpop <- hi(mFpop, "did_h:pop_z")
+
+# HonestDiD (relative magnitudes) on the sex-specific rate event studies
+es_vec <- function(model, pattern) {
+  b <- coef(model); V <- vcov(model); idx <- grep(pattern, names(b))
+  yrs <- as.integer(sub(".*year::([0-9]{4}).*", "\\1", names(b)[idx])); o <- order(yrs); idx <- idx[o]
+  list(beta = b[idx], sigma = V[idx, idx, drop = FALSE], years = sort(yrs))
+}
+bdn <- function(rm) { ex <- rm[rm$lb > 0 | rm$ub < 0, ]; if (nrow(ex)) max(ex$Mbar) else 0 }
+hd <- function(y, wt) {
+  m  <- feols(as.formula(sprintf("%s ~ i(year, treat_h, ref = %d) | %s", y, ref_year, fe)),
+              data = dShu, weights = wt, cluster = ~cod_mpio)
+  hu <- es_vec(m, "year::[0-9]{4}:treat_h"); nP <- sum(hu$years < ref_year); nQ <- sum(hu$years > ref_year)
+  rr <- function(l) createSensitivityResults_relativeMagnitudes(
+    betahat = hu$beta, sigma = hu$sigma, numPrePeriods = nP, numPostPeriods = nQ,
+    Mbarvec = seq(0, 2, by = 0.5), l_vec = l)
+  c(avg = bdn(rr(rep(1 / nQ, nQ))), first = bdn(rr(basisVector(index = 1, size = nQ))))
+}
+bdF <- hd("pro_he_F", ~w_F); bdM <- hd("pro_he_M", ~w_M)
+
+# joint Wald pre-trend tests for the sex-specific decomposition components
+esS <- function(y, wt) feols(
+  as.formula(sprintf("%s ~ i(year, treat_h, ref = %d) | %s", y, ref_year, fe)),
+  data = dShu, weights = wt, cluster = ~cod_mpio)
+pF_rate <- wald_pre(esS("pro_he_F",    ~w_F), "treat_h")$p_value
+pF_abs  <- wald_pre(esS("log1p_nhe_F", NULL), "treat_h")$p_value
+pF_den  <- wald_pre(esS("ltak_F",      NULL), "treat_h")$p_value
+```
+
+## Rate decomposition analysis
+
+Applying the numerator–denominator decomposition of @sec-mechanism-composition to each sex shows the larger female penalty is not, on average, a fall in women's absolute access (@tbl-appx-sex-decomp). Absolute female higher-education entrants rose after the ceasefire `r sprintf("%+.1f", 100*dFabs["est"])`% relative to unexposed municipalities) and almost identical to the male figure (`r sprintf("%+.1f", 100*dMabs["est"])`%). What differs by sex is the denominator.  The female exam-taker pool grew more (`r sprintf("%+.1f", 100*dFden["est"])`% versus `r sprintf("%+.1f", 100*dMden["est"])`% for men), so the female transition rate falls more (`r sprintf("%.2f", 100*dFrate["est"])` percentage points versus `r sprintf("%.2f", 100*dMrate["est"])` percentage points) even though the count of women reaching higher education does not. As in @sec-mechanism-composition, this female denominator channel fails its pre-trends test (joint Wald p-value = `r sprintf("%.3f", pF_den)`) and is read descriptively, whereas the female absolute-access and rate outcomes both pass it (joint Wald p-value = `r sprintf("%.3f", pF_abs)` and `r sprintf("%.3f", pF_rate)`, respectively).
+
+```{r tbl-appx-sex-decomp}
+#| tbl-cap: "Decomposition of the high-exposure effect by sex (high vs. unexposed)"
+srow <- function(y, wt, wcol, label) {
+  m  <- fdec(y, wt)
+  ct <- as.data.frame(coeftable(m))
+  d  <- dS |> filter(intensity == "high", !is.na(.data[[y]]))
+  if (!is.null(wcol)) d <- d |> filter(!is.na(.data[[wcol]]))
+  tibble(Component      = label,
+         Estimate       = 100 * ct["did_high_u", "Estimate"],
+         SE             = 100 * ct["did_high_u", "Std. Error"],
+         `p-value`      = ct["did_high_u", "Pr(>|t|)"],
+         `Treated mun.` = d |> distinct(cod_mpio) |> nrow(),
+         `Obs`          = nobs(m),
+         `R-squared`    = fixest::r2(m, "r2"))
+}
+
+bind_rows(
+  srow("ltak_F",      NULL,  NULL,  "Exam-takers female (%)"),
+  srow("ltak_M",      NULL,  NULL,  "Exam-takers male (%)"),
+  srow("log1p_nhe_F", NULL,  NULL,  "HE entrants female (%)"),
+  srow("log1p_nhe_M", NULL,  NULL,  "HE entrants male (%)"),
+  srow("pro_he_F",    ~w_F,  "w_F", "Transition rate female (pp)"),
+  srow("pro_he_M",    ~w_M,  "w_M", "Transition rate male (pp)")
+) |>
+  mutate(`p-value` = ifelse(`p-value` < 0.001, "<0.001", sprintf("%.3f", `p-value`)),
+         across(c(Estimate, SE), ~sprintf("%.2f", .x)),
+         `Obs` = format(`Obs`, big.mark = ","),
+         `R-squared` = sprintf("%.3f", `R-squared`)) |>
+  kbl(booktabs = TRUE, align = c("l", rep("c", 6))) |>
+  kable_styling(latex_options = "hold_position", full_width = FALSE) |>
+  column_spec(1, width = "4.5cm") |>
+  footnote(general = paste(
+    "Note: Sex-specific decomposition of the effect of high versus unexposed exposure on immediate higher education transition rates, estimated separately for female and male students using the three-category sample, with municipality and department-by-year fixed effects and standard errors clustered at the municipality level.",
+    "The transition rate is in percentage points and weighted by each municipality's 2010-2014 sex-specific average number of exam-takers; the numerator (higher-education entrants) and denominator (exam-takers) are counts in log(1 + var), read approximately as percentage changes, and unweighted.",
+    "Treated mun. counts the high-exposure municipalities identifying each estimate, 'Obs' the municipality-year observations, and 'R-squared' the model fit."),
+    general_title = "", threeparttable = TRUE)
+```
+
+The one genuine shortfall in women's absolute access is spatial, and it points back to the paper's mechanism. Moderating female absolute access by municipality size, the effect at an average-sized municipality is small and not significant (`r sprintf("%+.1f", 100*fpop["est"])`%), but access grows significantly more in larger municipalities and lags in the smallest. Women in the smallest, most heavily exposed municipalities are thus the group for whom absolute higher-education access genuinely falls short, the same places @sec-mechanism-size identifies as supply-constrained, and the group least able to leave home to reach a distant institution.
+
+## Sensitivity to parallel-trends violations
+
+The sex-specific levels do not survive a HonestDiD relative-magnitudes stress test (@fig-appx-sex-honest). For the average post-ceasefire effect, the robust confidence interval covers zero at the smallest violation considered for both sexes (breakdown $\bar M = 0$). Only the first post-period female effect tolerates a violation up to half the worst pre-period deviation (breakdown $\bar M =$ `r sprintf("%.1f", bdF["first"])`) before admitting zero. The sex-specific levels are therefore as fragile as the pooled high-exposure result of @sec-honestdid, and should be read as suggestive. Consequently, the most credible result is not the magnitude of the level effect for either female or male students, but the difference between them estimated in @sec-het-sex. Because this comparison is made within municipalities, it removes municipality-specific trends that affect both groups and that the sensitivity analysis identifies as a potential source of bias in the level estimates.
+
+```{r fig-appx-sex-honest}
+#| fig-cap: "HonestDiD relative-magnitudes sensitivity of the sex-specific high-exposure effect (high vs. unexposed)"
+#| fig-height: 7.5
+# Robust CIs across relative-magnitudes bounds, for each sex, stacked vertically.
+sens_sex <- function(y, wt, sexlab) {
+  m  <- feols(as.formula(sprintf("%s ~ i(year, treat_h, ref = %d) | %s", y, ref_year, fe)),
+              data = dShu, weights = wt, cluster = ~cod_mpio)
+  hu <- es_vec(m, "year::[0-9]{4}:treat_h")
+  nP <- sum(hu$years < ref_year); nQ <- sum(hu$years > ref_year)
+  l_avg <- rep(1 / nQ, nQ)
+  rmv <- createSensitivityResults_relativeMagnitudes(
+    betahat = hu$beta, sigma = hu$sigma,
+    numPrePeriods = nP, numPostPeriods = nQ,
+    Mbarvec = seq(0.5, 2, by = 0.5), l_vec = l_avg)
+  ocs <- constructOriginalCS(
+    betahat = hu$beta, sigma = hu$sigma,
+    numPrePeriods = nP, numPostPeriods = nQ, l_vec = l_avg)
+  rbind(
+    data.frame(x = "Original", lb = ocs$lb, ub = ocs$ub, method = "Original CI"),
+    data.frame(x = as.character(rmv$Mbar), lb = rmv$lb, ub = rmv$ub,
+               method = "HonestDiD robust CI")
+  ) |> transform(sex = sexlab)
+}
+
+sx_sens <- rbind(sens_sex("pro_he_F", ~w_F, "Female students"),
+                 sens_sex("pro_he_M", ~w_M, "Male students"))
+sx_sens$x   <- factor(sx_sens$x, levels = c("Original", "0.5", "1", "1.5", "2"))
+sx_sens$sex <- factor(sx_sens$sex, levels = c("Female students", "Male students"))
+
+ggplot(sx_sens, aes(x = x, colour = method)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "#121313") +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.18, linewidth = 0.6) +
+  geom_point(aes(y = (lb + ub) / 2), size = 2) +
+  facet_wrap(~sex, ncol = 1) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_colour_manual(values = c("Original CI" = farc_palette[["Unexposed"]],
+                                 "HonestDiD robust CI" = farc_palette[["High"]])) +
+  theme_capstone() +
+  theme(legend.position = "bottom") +
+  labs(x = expression(paste("Relative-magnitudes bound  ", bar(M))),
+       y = "Effect on immediate HE transition rate \n(average post-ceasefire)",
+       colour = NULL,
+       title = "HonestDiD sensitivity by student sex",
+       caption = paste(
+         "Note: Rambachan and Roth (2023) relative-magnitudes sensitivity analysis of the average post-ceasefire high-vs-unexposed",
+         "\neffect on the sex-specific higher-education access rate, estimated separately for female (top) and male (bottom) students. The",
+         "\nhorizontal axis is the largest post-treatment violation of parallel trends allowed, Mbar, as a multiple of the largest pre-treatment violation.",
+         "\n'Original CI' is the conventional 95% interval and 'HonestDiD robust CI' is the robust confidence set."))
+```
+
+# Replication material
+
+All data and analytical workflows necessary for reproducing the reported results are hosted in the public GitHub repository X. The accompanying README file details the repository organisation, describes the contents of each folder and script, and outlines the procedures required for replication. 

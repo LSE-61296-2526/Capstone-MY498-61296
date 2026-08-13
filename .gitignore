@@ -1,0 +1,19 @@
+# Literature PDFs
+0. Documents/Literature/
+
+# Generated outputs
+3. Results/
+1. Data/
+
+# RStudio
+.Rproj.user/
+.Rhistory
+.RData
+
+# Temporary files
+*.log
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
