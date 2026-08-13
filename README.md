@@ -1,7 +1,7 @@
 # Violence Reduction and Immediate Access to Higher Education
 ## Post-Conflict Evidence from Colombia
 
-**Post-Conflict Evidence from Colombia — MY498 Capstone Project**
+**MY498 Capstone Project**
 
 MSc Applied Social Data Science, Department of Methodology, LSE
 Candidate 61296 · Supervisor: Eleanor Power
